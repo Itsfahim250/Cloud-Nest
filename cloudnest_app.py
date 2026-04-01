@@ -1347,12 +1347,13 @@ Console.WriteLine(await res.Content.ReadAsStringAsync());""",
 # FLASK ROUTES
 # =============================================================================
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "HEAD"])
 def index():
     return jsonify({"status": "ok", "service": "CloudNest Backend Manager", "time": now_iso()}), 200
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/health", methods=["GET", "HEAD"])
+@app.route("/ping", methods=["GET", "HEAD"]) # Added ping as some cron services prefer this path
 def health():
     return jsonify({"status": "healthy", "service": "CloudNest Backend Manager", "time": now_iso()}), 200
 
@@ -1920,12 +1921,15 @@ def run_bot():
             print(f"[BOT] polling error: {e}")
             time.sleep(5)
 
+# Start bot in background (works properly for both Gunicorn and normal python execution)
+# Using a flag to prevent multiple thread starts if the file gets re-imported
+if not os.environ.get("WERKZEUG_RUN_MAIN"):
+    _bot_thread = threading.Thread(target=run_bot, daemon=True)
+    _bot_thread.start()
 
 if __name__ == "__main__":
     print("CloudNest backend starting...")
     print(f"Port: {PORT}")
     print(f"Base URL: {get_public_base_url()}")
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
+    # The app.run() block is only used locally. Render uses Gunicorn automatically.
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
