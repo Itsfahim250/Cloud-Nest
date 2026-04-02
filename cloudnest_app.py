@@ -131,9 +131,12 @@ def is_admin(chat_id: str) -> bool:
     return str(chat_id) in ADMIN_CHAT_IDS
 
 def get_public_base_url() -> str:
-    if PUBLIC_BASE_URL:
-        return PUBLIC_BASE_URL
-    return f"http://127.0.0.1:{PORT}"
+    try:
+        if request and request.url_root:
+            return request.url_root.rstrip("/")
+    except Exception:
+        pass
+    return "https://cloud-nest-q8o9.onrender.com"
 
 # --- EMAIL SENDER (FACEBOOK STYLE TEMPLATE FOR BOT REGISTRATION) ---
 def send_otp_email(to_email, otp_code):
