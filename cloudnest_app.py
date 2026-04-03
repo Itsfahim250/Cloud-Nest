@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 import smtplib
-import secrets
+import random
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -14,7 +14,6 @@ from telebot import types
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from werkzeug.middleware.proxy_fix import ProxyFix
 
 # =============================================================================
 # CONFIG
@@ -31,14 +30,13 @@ ADMIN_CHAT_IDS = {x.strip() for x in ADMIN_CHAT_IDS_RAW.split(",") if x.strip()}
 if not ADMIN_CHAT_IDS:
     ADMIN_CHAT_IDS = set()
 
-# ---- ঠিক এই জায়গাটুকু পরিবর্তন করুন ----
 # SMTP CONFIG FOR OTP
 SMTP_EMAIL = "cloudnestotp@gmail.com"
 SMTP_PASSWORD = "smeu dhdn zdou yfwc"
 
 # ADMIN API KEY
 ADMIN_API_KEY = "rf_admin250fahim771357013"
-# ----------------------------------------
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 UPLOAD_FOLDER = os.path.join(DATA_DIR, "uploads")
@@ -46,7 +44,7 @@ USER_DATA_FILE = os.path.join(DATA_DIR, "users.json")
 PREMIUM_CODES_FILE = os.path.join(DATA_DIR, "premium_codes.json")
 SESSION_FILE = os.path.join(DATA_DIR, "sessions.json")
 
-# NEW FILES FOR PERSISTING DATA (Fixed memory reset issue)
+# JSON FILES FOR PERSISTENT STORAGE (prevents data loss on server restart)
 DEV_OTPS_FILE = os.path.join(DATA_DIR, "dev_otps.json")
 TEMP_AUTH_STATE_FILE = os.path.join(DATA_DIR, "temp_auth_state.json")
 PENDING_ACTIONS_FILE = os.path.join(DATA_DIR, "pending_actions.json")
@@ -56,8 +54,6 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 app = Flask(__name__)
-# Fix for Render Proxy URLs (https fix)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 CORS(app)
 
 # =============================================================================
@@ -133,6 +129,8 @@ def save_premium_codes(codes: dict) -> None:
     with STORE_LOCK:
         save_json_file(PREMIUM_CODES_FILE, codes)
 
+# --- PERSISTENT JSON HELPERS (prevents RAM wipe data loss) ---
+
 def load_dev_otps() -> dict:
     with STORE_LOCK:
         data = load_json_file(DEV_OTPS_FILE, {})
@@ -159,6 +157,8 @@ def load_pending_actions() -> dict:
 def save_pending_actions(data: dict) -> None:
     with STORE_LOCK:
         save_json_file(PENDING_ACTIONS_FILE, data)
+
+# ------------------------------------------------------------
 
 def is_admin(chat_id: str) -> bool:
     return str(chat_id) in ADMIN_CHAT_IDS
@@ -216,7 +216,6 @@ def send_user_otp_email(to_email, otp_code):
             <h2>Verification Code</h2>
             <p>Your requested code is: <strong>{otp_code}</strong></p>
             <p>Please use this code to verify your action. The code will expire in 5 minutes.</p>
-            <br>
             <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
             <p style="font-size: 12px; color: #666;">
                 <em>This OTP service is powered by CloudNest API.</em><br><br>
@@ -285,8 +284,7 @@ def feature_limit_status(user_info: dict, feature: str) -> tuple:
     percent = (used / limit * 100.0) if limit else 0.0
     return used, limit, round(percent, 1)
 
-# FIXED: Handle dynamic amounts for Storage & DB bytes tracking
-def consume_feature(email: str, feature: str, amount: int = 1) -> tuple:
+def consume_feature(email: str, feature: str) -> tuple:
     with STORE_LOCK:
         users = load_users()
         # Handle Admin API Bypass correctly
@@ -296,46 +294,25 @@ def consume_feature(email: str, feature: str, amount: int = 1) -> tuple:
         user_info = users.get(email)
         if not user_info:
             return False, {}
-            
-        user_info.setdefault("usage", {})
-        used = int(user_info["usage"].get(feature, 0))
-        limit = int(FREE_LIMITS.get(feature, 0))
-        
-        # If premium, update usage but don't enforce limit
         if user_info.get("premium"):
-            user_info["usage"][feature] = used + amount
+            user_info.setdefault("usage", {})
+            user_info["usage"][feature] = int(user_info["usage"].get(feature, 0)) + 1
             users[email] = user_info
             save_users(users)
             return True, user_info
 
-        # Check free limit
-        if limit and (used + amount) > limit:
+        user_info.setdefault("usage", {})
+        used = int(user_info["usage"].get(feature, 0))
+        limit = int(FREE_LIMITS.get(feature, 0))
+        if limit and used >= limit:
+            users[email] = user_info
+            save_users(users)
             return False, user_info
 
-        user_info["usage"][feature] = used + amount
+        user_info["usage"][feature] = used + 1
         users[email] = user_info
         save_users(users)
         return True, user_info
-
-# ADDED: To refund space when files/db records are deleted
-def refund_feature(email: str, feature: str, amount: int) -> None:
-    with STORE_LOCK:
-        users = load_users()
-        user_info = users.get(email)
-        if not user_info:
-            return
-        user_info.setdefault("usage", {})
-        used = int(user_info["usage"].get(feature, 0))
-        new_used = max(0, used - amount)
-        user_info["usage"][feature] = new_used
-        users[email] = user_info
-        save_users(users)
-
-def format_size(bytes_size: int) -> str:
-    if bytes_size < 1024: return f"{bytes_size} B"
-    elif bytes_size < 1024 * 1024: return f"{bytes_size/1024:.2f} KB"
-    elif bytes_size < 1024 * 1024 * 1024: return f"{bytes_size/(1024*1024):.2f} MB"
-    else: return f"{bytes_size/(1024*1024*1024):.2f} GB"
 
 def percent_text(used: int, limit: int) -> str:
     if limit <= 0:
@@ -347,16 +324,10 @@ def usage_summary(user_info: dict) -> str:
     for feature, limit in FREE_LIMITS.items():
         used = int((user_info.get("usage") or {}).get(feature, 0))
         display_limit = FREE_LIMITS_DISPLAY.get(feature, str(limit))
-        
-        if feature in ["db_ops", "upload_ops"]:
-            used_display = format_size(used)
-        else:
-            used_display = str(used)
-
         if user_info.get("premium"):
-            lines.append(f"- {feature}: {used_display} used | Premium = Unlimited")
+            lines.append(f"- {feature}: {used} used | Premium = Unlimited")
         else:
-            lines.append(f"- {feature}: {used_display} / {display_limit}")
+            lines.append(f"- {feature}: {used}/{display_limit}")
     return "\n".join(lines)
 
 
@@ -453,6 +424,8 @@ def otp_ops_keyboard(lang: str):
         op_key = op.lower().replace(" ", "_")
         markup.add(types.InlineKeyboardButton(op, callback_data=f"otpop_{lang}_{op_key}"))
     return markup
+
+# --- PENDING ACTIONS (persistent via JSON file) ---
 
 def set_pending_action(chat_id: str, action: str):
     with STORE_LOCK:
@@ -1284,36 +1257,31 @@ try (Response r = client.newCall(request).execute()) {{ System.out.println(r.bod
             "login": f"""// ✅ C# — Login
 using var client = new HttpClient();
 var payload = new {{ api_key = "{api_key}", action = "login", username = "user1", password = "pass123" }};
-var res = await client.PostAsync("{host}/api/auth",
-    new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+var res = await client.PostAsync("{host}/api/auth", new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
 Console.WriteLine(await res.Content.ReadAsStringAsync());""",
 
             "register": f"""// ✅ C# — Register
 using var client = new HttpClient();
 var payload = new {{ api_key = "{api_key}", action = "register", username = "user1", password = "pass123" }};
-var res = await client.PostAsync("{host}/api/auth",
-    new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+var res = await client.PostAsync("{host}/api/auth", new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
 Console.WriteLine(await res.Content.ReadAsStringAsync());""",
 
             "auth_load": f"""// ✅ C# — Auth Load
 using var client = new HttpClient();
 var payload = new {{ api_key = "{api_key}", action = "list" }};
-var res = await client.PostAsync("{host}/api/auth",
-    new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+var res = await client.PostAsync("{host}/api/auth", new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
 Console.WriteLine(await res.Content.ReadAsStringAsync());""",
 
             "auth_delete": f"""// ✅ C# — Auth Delete
 using var client = new HttpClient();
 var payload = new {{ api_key = "{api_key}", action = "delete", username = "user1" }};
-var res = await client.PostAsync("{host}/api/auth",
-    new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+var res = await client.PostAsync("{host}/api/auth", new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
 Console.WriteLine(await res.Content.ReadAsStringAsync());""",
 
             "password_change": f"""// ✅ C# — Password Change
 using var client = new HttpClient();
 var payload = new {{ api_key = "{api_key}", action = "update_password", username = "user1", new_password = "newpass456" }};
-var res = await client.PostAsync("{host}/api/auth",
-    new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+var res = await client.PostAsync("{host}/api/auth", new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
 Console.WriteLine(await res.Content.ReadAsStringAsync());""",
         },
     }
@@ -1328,8 +1296,6 @@ def get_storage_code(lang: str, op: str, api_key: str, host: str) -> str:
     codes = {
         "javascript": {
             "upload": f"""// ✅ JavaScript — File Upload
-// HTML: <input type="file" id="fileInput">
-const fileInput = document.getElementById('fileInput');
 const formData = new FormData();
 formData.append('file', fileInput.files[0]);
 formData.append('api_key', '{api_key}');
@@ -1583,17 +1549,17 @@ def api_otp_send():
         used, limit, pct = feature_limit_status(user_info, "otp_sends")
         return jsonify({"status": "error", "message": "Free OTP limit reached.", "usage": {"used": used, "limit": limit, "percent": pct}}), 429
 
-    # SECURE OTP GENERATION
-    otp_code = str(secrets.randbelow(900000) + 100000)
-    
+    otp_code = str(random.randint(100000, 999999))
     if send_user_otp_email(email, otp_code):
         key = f"{api_key}_{email}"
-        otps = load_dev_otps()
-        otps[key] = {
-            "otp": otp_code,
-            "expires": time.time() + 300 # 5 minutes
-        }
-        save_dev_otps(otps)
+        # Save OTP to JSON file (persistent, survives server restart)
+        with STORE_LOCK:
+            otps = load_dev_otps()
+            otps[key] = {
+                "otp": otp_code,
+                "expires": time.time() + 300  # 5 minutes
+            }
+            save_dev_otps(otps)
         return jsonify({"status": "success", "message": "OTP sent successfully."})
     return jsonify({"status": "error", "message": "Failed to send email."}), 500
 
@@ -1613,19 +1579,20 @@ def api_otp_verify():
         return jsonify({"status": "error", "message": "Invalid API Key."}), 401
 
     key = f"{api_key}_{email}"
-    otps = load_dev_otps()
-    record = otps.get(key)
-    
-    if not record: 
-        return jsonify({"status": "error", "message": "OTP not found or not sent."}), 404
-    if time.time() > record["expires"]:
-        del otps[key]
-        save_dev_otps(otps)
-        return jsonify({"status": "error", "message": "OTP expired."}), 400
-    if record["otp"] == otp:
-        del otps[key]
-        save_dev_otps(otps)
-        return jsonify({"status": "success", "message": "OTP verified successfully."})
+    with STORE_LOCK:
+        otps = load_dev_otps()
+        record = otps.get(key)
+        
+        if not record:
+            return jsonify({"status": "error", "message": "OTP not found or not sent."}), 404
+        if time.time() > record["expires"]:
+            del otps[key]
+            save_dev_otps(otps)
+            return jsonify({"status": "error", "message": "OTP expired."}), 400
+        if record["otp"] == otp:
+            del otps[key]
+            save_dev_otps(otps)
+            return jsonify({"status": "success", "message": "OTP verified successfully."})
     
     return jsonify({"status": "error", "message": "Invalid OTP."}), 400
 
@@ -1645,20 +1612,14 @@ def api_db():
     if not dev_email:
         return jsonify({"status": "error", "message": "Invalid API Key."}), 401
 
+    allowed, user_info = consume_feature(dev_email, "db_ops")
+    if not allowed and not user_info.get("premium"):
+        used, limit, pct = feature_limit_status(user_info, "db_ops")
+        return jsonify({"status": "error", "message": "Free database limit reached.", "usage": {"used": used, "limit": limit, "percent": pct}}), 429
+
     db_data = load_dev_db(dev_info)
 
     if action == "save":
-        payload_size = len(str(payload).encode('utf-8'))
-        old_payload_size = len(str(db_data.get(key, "")).encode('utf-8')) if key in db_data else 0
-        net_size_increase = payload_size - old_payload_size
-        
-        if net_size_increase > 0:
-            allowed, user_info = consume_feature(dev_email, "db_ops", amount=net_size_increase)
-            if not allowed and not user_info.get("premium"):
-                return jsonify({"status": "error", "message": "Database free storage limit reached."}), 429
-        elif net_size_increase < 0:
-            refund_feature(dev_email, "db_ops", abs(net_size_increase))
-            
         db_data[key] = payload
         save_dev_db(dev_info, db_data)
         return jsonify({"status": "success", "message": "Data saved!"})
@@ -1668,10 +1629,8 @@ def api_db():
 
     if action == "delete":
         if key in db_data:
-            old_payload_size = len(str(db_data[key]).encode('utf-8'))
             del db_data[key]
             save_dev_db(dev_info, db_data)
-            refund_feature(dev_email, "db_ops", old_payload_size)
             return jsonify({"status": "success", "message": f"Key '{key}' deleted."})
         return jsonify({"status": "error", "message": "Key not found."}), 404
 
@@ -1694,13 +1653,14 @@ def api_auth():
     if not dev_email:
         return jsonify({"status": "error", "message": "Invalid API Key."}), 401
 
+    allowed, user_info = consume_feature(dev_email, "auth_ops")
+    if not allowed and not user_info.get("premium"):
+        used, limit, pct = feature_limit_status(user_info, "auth_ops")
+        return jsonify({"status": "error", "message": "Free authentication limit reached.", "usage": {"used": used, "limit": limit, "percent": pct}}), 429
+
     auth_data = load_dev_auth(dev_info)
 
     if action == "register":
-        allowed, user_info = consume_feature(dev_email, "auth_ops")
-        if not allowed and not user_info.get("premium"):
-            return jsonify({"status": "error", "message": "Auth members limit reached."}), 429
-            
         if not username or not password:
             return jsonify({"status": "error", "message": "username and password are required."}), 400
         if username in auth_data:
@@ -1725,7 +1685,6 @@ def api_auth():
             return jsonify({"status": "error", "message": "User not found."}), 404
         del auth_data[username]
         save_dev_auth(dev_info, auth_data)
-        refund_feature(dev_email, "auth_ops", 1) # Refund 1 user slot
         return jsonify({"status": "success", "message": f"User '{username}' deleted."})
 
     if action == "update_password":
@@ -1752,21 +1711,17 @@ def upload_file():
     if not dev_email:
         return jsonify({"status": "error", "message": "Invalid API Key."}), 401
 
+    allowed, user_info = consume_feature(dev_email, "upload_ops")
+    if not allowed and not user_info.get("premium"):
+        used, limit, pct = feature_limit_status(user_info, "upload_ops")
+        return jsonify({"status": "error", "message": "Free upload limit reached.", "usage": {"used": used, "limit": limit, "percent": pct}}), 429
+
     if "file" not in request.files:
         return jsonify({"status": "error", "message": "No file uploaded"}), 400
 
     file = request.files["file"]
     if not file or file.filename == "":
         return jsonify({"status": "error", "message": "Empty file"}), 400
-
-    # Calculate actual file size in bytes
-    file.seek(0, os.SEEK_END)
-    file_size = file.tell()
-    file.seek(0) # Reset file pointer
-
-    allowed, user_info = consume_feature(dev_email, "upload_ops", amount=file_size)
-    if not allowed and not user_info.get("premium"):
-        return jsonify({"status": "error", "message": "Free storage capacity limit reached."}), 429
 
     filename = secure_filename(file.filename)
     unique_filename = f"{dev_info['api_key']}_{uuid.uuid4().hex[:8]}_{filename}"
@@ -1798,9 +1753,7 @@ def delete_storage_file():
 
     filepath = os.path.join(UPLOAD_FOLDER, secure_filename(filename))
     if os.path.exists(filepath):
-        file_size = os.path.getsize(filepath)
         os.remove(filepath)
-        refund_feature(dev_email, "upload_ops", file_size) # Refund Storage Space
         return jsonify({"status": "success", "message": f"File '{filename}' deleted."})
     return jsonify({"status": "error", "message": "File not found."}), 404
 
@@ -1816,10 +1769,12 @@ def uploaded_file(filename):
 @bot.message_handler(commands=["start", "restart"])
 def command_start(message):
     chat_id = str(message.chat.id)
-    auth_state_db = load_temp_auth_state()
-    if chat_id in auth_state_db:
-        del auth_state_db[chat_id]
-        save_temp_auth_state(auth_state_db)
+    # Clear any ongoing auth state from JSON file
+    with STORE_LOCK:
+        auth_state_db = load_temp_auth_state()
+        if chat_id in auth_state_db:
+            del auth_state_db[chat_id]
+            save_temp_auth_state(auth_state_db)
 
     email, user_info = get_logged_in_user(chat_id)
     if email:
@@ -1928,7 +1883,7 @@ def handle_messages(message):
     if not text:
         return
 
-    # Check for ongoing Auth Flow
+    # Check for ongoing Auth Flow (loaded from JSON file, not memory)
     auth_state_db = load_temp_auth_state()
     auth_state = auth_state_db.get(chat_id)
     if auth_state:
@@ -1944,30 +1899,38 @@ def handle_messages(message):
                 users = load_users()
                 if text in users:
                     bot.send_message(chat_id, "❌ This email is already registered. Please login.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    with STORE_LOCK:
+                        auth_state_db = load_temp_auth_state()
+                        del auth_state_db[chat_id]
+                        save_temp_auth_state(auth_state_db)
                     return
                 
                 bot.send_message(chat_id, "Sending Verification OTP to your email... Please wait.")
-                otp = str(secrets.randbelow(900000) + 100000)
+                otp = str(random.randint(100000, 999999))
                 if send_otp_email(text, otp):
-                    auth_state_db[chat_id]["email"] = text
-                    auth_state_db[chat_id]["otp"] = otp
-                    auth_state_db[chat_id]["state"] = "await_otp"
-                    save_temp_auth_state(auth_state_db)
+                    with STORE_LOCK:
+                        auth_state_db = load_temp_auth_state()
+                        auth_state_db[chat_id]["email"] = text
+                        auth_state_db[chat_id]["otp"] = otp
+                        auth_state_db[chat_id]["state"] = "await_otp"
+                        save_temp_auth_state(auth_state_db)
                     bot.send_message(chat_id, "✅ OTP Sent! Please check your email and enter the 6-digit code:")
                 else:
                     bot.send_message(chat_id, "❌ Failed to send OTP email. Please try again later.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    with STORE_LOCK:
+                        auth_state_db = load_temp_auth_state()
+                        del auth_state_db[chat_id]
+                        save_temp_auth_state(auth_state_db)
                 return
 
             if state == "await_otp":
                 if text != auth_state["otp"]:
                     bot.send_message(chat_id, "❌ Incorrect OTP. Try again:")
                     return
-                auth_state_db[chat_id]["state"] = "await_pass"
-                save_temp_auth_state(auth_state_db)
+                with STORE_LOCK:
+                    auth_state_db = load_temp_auth_state()
+                    auth_state_db[chat_id]["state"] = "await_pass"
+                    save_temp_auth_state(auth_state_db)
                 bot.send_message(chat_id, "✅ Email Verified!\n\nPlease set a password for your CloudNest account:")
                 return
 
@@ -1992,8 +1955,10 @@ def handle_messages(message):
                 sessions[chat_id] = email
                 save_sessions(sessions)
                 
-                del auth_state_db[chat_id]
-                save_temp_auth_state(auth_state_db)
+                with STORE_LOCK:
+                    auth_state_db = load_temp_auth_state()
+                    del auth_state_db[chat_id]
+                    save_temp_auth_state(auth_state_db)
 
                 msg = f"🎉 Account Registered Successfully!\n\nYour API Key:\n<code>{api_key}</code>\n\n(Tap the key to copy)"
                 bot.send_message(chat_id, msg, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
@@ -2005,30 +1970,38 @@ def handle_messages(message):
                 users = load_users()
                 if text not in users:
                     bot.send_message(chat_id, "❌ Email not found. Please register first.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    with STORE_LOCK:
+                        auth_state_db = load_temp_auth_state()
+                        del auth_state_db[chat_id]
+                        save_temp_auth_state(auth_state_db)
                     return
                 
                 bot.send_message(chat_id, "Sending Login OTP... Please wait.")
-                otp = str(secrets.randbelow(900000) + 100000)
+                otp = str(random.randint(100000, 999999))
                 if send_otp_email(text, otp):
-                    auth_state_db[chat_id]["email"] = text
-                    auth_state_db[chat_id]["otp"] = otp
-                    auth_state_db[chat_id]["state"] = "await_otp"
-                    save_temp_auth_state(auth_state_db)
+                    with STORE_LOCK:
+                        auth_state_db = load_temp_auth_state()
+                        auth_state_db[chat_id]["email"] = text
+                        auth_state_db[chat_id]["otp"] = otp
+                        auth_state_db[chat_id]["state"] = "await_otp"
+                        save_temp_auth_state(auth_state_db)
                     bot.send_message(chat_id, "✅ OTP Sent! Please check your email and enter the 6-digit code:")
                 else:
                     bot.send_message(chat_id, "❌ Failed to send OTP.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    with STORE_LOCK:
+                        auth_state_db = load_temp_auth_state()
+                        del auth_state_db[chat_id]
+                        save_temp_auth_state(auth_state_db)
                 return
 
             if state == "await_otp":
                 if text != auth_state["otp"]:
                     bot.send_message(chat_id, "❌ Incorrect OTP. Try again:")
                     return
-                auth_state_db[chat_id]["state"] = "await_pass"
-                save_temp_auth_state(auth_state_db)
+                with STORE_LOCK:
+                    auth_state_db = load_temp_auth_state()
+                    auth_state_db[chat_id]["state"] = "await_pass"
+                    save_temp_auth_state(auth_state_db)
                 bot.send_message(chat_id, "✅ OTP Verified!\n\nEnter your account password:")
                 return
 
@@ -2037,36 +2010,44 @@ def handle_messages(message):
                 users = load_users()
                 if users[email]["password"] != text:
                     bot.send_message(chat_id, "❌ Incorrect Password. Login failed.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    with STORE_LOCK:
+                        auth_state_db = load_temp_auth_state()
+                        del auth_state_db[chat_id]
+                        save_temp_auth_state(auth_state_db)
                     return
 
                 sessions = load_sessions()
                 sessions[chat_id] = email
                 save_sessions(sessions)
 
-                del auth_state_db[chat_id]
-                save_temp_auth_state(auth_state_db)
+                with STORE_LOCK:
+                    auth_state_db = load_temp_auth_state()
+                    del auth_state_db[chat_id]
+                    save_temp_auth_state(auth_state_db)
 
                 api_key = users[email]["api_key"]
                 msg = f"✅ Logged in successfully!\n\nYour API Key:\n<code>{api_key}</code>\n\n(Tap the key to copy)"
                 bot.send_message(chat_id, msg, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
                 return
 
+    # Check for Login commands triggers
     if text == "Register":
-        auth_state_db = load_temp_auth_state()
-        auth_state_db[chat_id] = {"action": "register", "state": "await_email"}
-        save_temp_auth_state(auth_state_db)
+        with STORE_LOCK:
+            auth_state_db = load_temp_auth_state()
+            auth_state_db[chat_id] = {"action": "register", "state": "await_email"}
+            save_temp_auth_state(auth_state_db)
         bot.send_message(chat_id, "Enter your Gmail address (@gmail.com):", reply_markup=types.ReplyKeyboardRemove())
         return
 
     if text == "Login":
-        auth_state_db = load_temp_auth_state()
-        auth_state_db[chat_id] = {"action": "login", "state": "await_email"}
-        save_temp_auth_state(auth_state_db)
+        with STORE_LOCK:
+            auth_state_db = load_temp_auth_state()
+            auth_state_db[chat_id] = {"action": "login", "state": "await_email"}
+            save_temp_auth_state(auth_state_db)
         bot.send_message(chat_id, "Enter your registered Gmail address:", reply_markup=types.ReplyKeyboardRemove())
         return
 
+    # Ensure user is logged in for normal operations
     email, user_info = get_logged_in_user(chat_id)
     if not email:
         bot.send_message(chat_id, "You must login first.", reply_markup=auth_welcome_keyboard())
@@ -2080,6 +2061,7 @@ def handle_messages(message):
         bot.send_message(chat_id, "✅ Logged out successfully.", reply_markup=auth_welcome_keyboard())
         return
 
+    # Normal user flows
     pending = get_pending_action(chat_id)
     if pending == "redeem_premium":
         pop_pending_action(chat_id)
@@ -2141,6 +2123,11 @@ def handle_messages(message):
         return
 
     if text == "Authentication":
+        allowed, _ = consume_feature(email, "auth_ops")
+        if not allowed and not user_info.get("premium"):
+            used, limit, pct = feature_limit_status(user_info, "auth_ops")
+            bot.send_message(chat_id, f"Free authentication limit reached.\nUsed: {used}/{limit} ({pct}%)", reply_markup=main_keyboard(chat_id))
+            return
         bot.send_message(chat_id, "Authentication panel:", reply_markup=auth_inline_keyboard())
         return
 
@@ -2195,6 +2182,7 @@ def callback_handler(call):
         bot.answer_callback_query(call.id, "Please login first.")
         return
 
+    # ---- Auth panel callbacks ----
     if data == "show_auth":
         bot.answer_callback_query(call.id)
         show_auth_users(chat_id, email)
@@ -2206,6 +2194,7 @@ def callback_handler(call):
         bot.send_message(chat_id, "Send in this format:\nusername|new_password")
         return
 
+    # ---- Premium callbacks ----
     if data == "premium_redeem":
         bot.answer_callback_query(call.id)
         set_pending_action(chat_id, "redeem_premium")
@@ -2231,6 +2220,7 @@ def callback_handler(call):
         bot.send_message(chat_id, msg, parse_mode="Markdown")
         return
 
+    # ---- Storage delete callback ----
     if data.startswith("storage_del_"):
         bot.answer_callback_query(call.id)
         filename = data[len("storage_del_"):]
@@ -2240,9 +2230,7 @@ def callback_handler(call):
             return
         filepath = os.path.join(UPLOAD_FOLDER, secure_filename(filename))
         if os.path.exists(filepath):
-            file_size = os.path.getsize(filepath)
             os.remove(filepath)
-            refund_feature(email, "upload_ops", file_size)
             parts = filename.split("_", 2)
             display_name = parts[2] if len(parts) >= 3 else filename
             bot.send_message(chat_id, f"🗑 Deleted: {display_name}", reply_markup=main_keyboard(chat_id))
@@ -2250,6 +2238,7 @@ def callback_handler(call):
             bot.send_message(chat_id, "File not found.", reply_markup=main_keyboard(chat_id))
         return
 
+    # ---- Project Settings: section selection ----
     if data == "proj_db":
         bot.answer_callback_query(call.id)
         bot.send_message(chat_id, "🗄 Database — Choose Language:", reply_markup=lang_keyboard("db"))
@@ -2270,6 +2259,7 @@ def callback_handler(call):
         bot.send_message(chat_id, "📧 OTP System — Choose Language:", reply_markup=lang_keyboard("otp"))
         return
 
+    # ---- Language selected ----
     if data.startswith("lang_db_"):
         lang = data[len("lang_db_"):]
         bot.answer_callback_query(call.id)
@@ -2294,6 +2284,7 @@ def callback_handler(call):
         bot.send_message(chat_id, f"📧 OTP — {lang.capitalize()} — Choose Operation:", reply_markup=otp_ops_keyboard(lang))
         return
 
+    # ---- Operation Code Handlers ----
     if data.startswith("dbop_"):
         parts = data[len("dbop_"):].split("_", 1)
         if len(parts) == 2:
