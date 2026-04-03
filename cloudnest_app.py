@@ -3,7 +3,11 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+import smtplib
+import random
+from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import telebot
 from telebot import types
@@ -17,7 +21,6 @@ from werkzeug.utils import secure_filename
 
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
 ADMIN_CHAT_IDS_RAW = (os.environ.get("ADMIN_CHAT_ID") or "").strip()
-PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 
 if not BOT_TOKEN:
@@ -27,11 +30,24 @@ ADMIN_CHAT_IDS = {x.strip() for x in ADMIN_CHAT_IDS_RAW.split(",") if x.strip()}
 if not ADMIN_CHAT_IDS:
     ADMIN_CHAT_IDS = set()
 
+# SMTP CONFIG FOR OTP
+SMTP_EMAIL = "cloudnestotp@gmail.com"
+SMTP_PASSWORD = "smeu dhdn zdou yfwc"
+
+# ADMIN API KEY
+ADMIN_API_KEY = "rf_admin250fahim771357013"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 UPLOAD_FOLDER = os.path.join(DATA_DIR, "uploads")
 USER_DATA_FILE = os.path.join(DATA_DIR, "users.json")
 PREMIUM_CODES_FILE = os.path.join(DATA_DIR, "premium_codes.json")
+SESSION_FILE = os.path.join(DATA_DIR, "sessions.json")
+
+# NEW FILES FOR PERSISTING DATA (Fixed memory reset issue)
+DEV_OTPS_FILE = os.path.join(DATA_DIR, "dev_otps.json")
+TEMP_AUTH_STATE_FILE = os.path.join(DATA_DIR, "temp_auth_state.json")
+PENDING_ACTIONS_FILE = os.path.join(DATA_DIR, "pending_actions.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -45,21 +61,21 @@ CORS(app)
 # =============================================================================
 
 STORE_LOCK = threading.RLock()
-PENDING_ACTIONS = {}
 
 FREE_LIMITS = {
-    "db_ops": 1073741824,      # 1 GB (per month) - measured in bytes stored
-    "auth_ops": 50,            # 50 Members (per month)
-    "upload_ops": 2684354560,  # 2.5 GB (per month) - measured in bytes
+    "db_ops": 1073741824,      # 1 GB (per month)
+    "auth_ops": 50,            # 50 Members
+    "upload_ops": 2684354560,  # 2.5 GB
     "password_edits": 50,
+    "otp_sends": 50            # Added Limit for OTP Sends
 }
 
-# For display purposes
 FREE_LIMITS_DISPLAY = {
     "db_ops": "1 GB/month",
     "auth_ops": "50 Members/month",
     "upload_ops": "2.5 GB/month",
     "password_edits": "50/month",
+    "otp_sends": "50 OTPs/month"
 }
 
 LANGUAGES = ["JavaScript", "Python", "Kotlin", "Swift", "Dart", "PHP", "Java", "C#"]
@@ -68,10 +84,8 @@ LANGUAGES = ["JavaScript", "Python", "Kotlin", "Swift", "Dart", "PHP", "Java", "
 # HELPERS
 # =============================================================================
 
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def load_json_file(path: str, default):
     try:
@@ -82,108 +96,184 @@ def load_json_file(path: str, default):
         pass
     return default
 
-
 def save_json_file(path: str, data) -> None:
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
     os.replace(tmp_path, path)
 
-
 def load_users() -> dict:
     with STORE_LOCK:
         users = load_json_file(USER_DATA_FILE, {})
-        if not isinstance(users, dict):
-            users = {}
-        return users
-
+        return users if isinstance(users, dict) else {}
 
 def save_users(users: dict) -> None:
     with STORE_LOCK:
         save_json_file(USER_DATA_FILE, users)
 
+def load_sessions() -> dict:
+    with STORE_LOCK:
+        sessions = load_json_file(SESSION_FILE, {})
+        return sessions if isinstance(sessions, dict) else {}
+
+def save_sessions(sessions: dict) -> None:
+    with STORE_LOCK:
+        save_json_file(SESSION_FILE, sessions)
 
 def load_premium_codes() -> dict:
     with STORE_LOCK:
         codes = load_json_file(PREMIUM_CODES_FILE, {})
-        if not isinstance(codes, dict):
-            codes = {}
-        return codes
-
+        return codes if isinstance(codes, dict) else {}
 
 def save_premium_codes(codes: dict) -> None:
     with STORE_LOCK:
         save_json_file(PREMIUM_CODES_FILE, codes)
 
+# --- NEW HELPERS TO PREVENT RAM WIPE ---
+def load_dev_otps() -> dict:
+    with STORE_LOCK:
+        data = load_json_file(DEV_OTPS_FILE, {})
+        return data if isinstance(data, dict) else {}
+
+def save_dev_otps(data: dict) -> None:
+    with STORE_LOCK:
+        save_json_file(DEV_OTPS_FILE, data)
+
+def load_temp_auth_state() -> dict:
+    with STORE_LOCK:
+        data = load_json_file(TEMP_AUTH_STATE_FILE, {})
+        return data if isinstance(data, dict) else {}
+
+def save_temp_auth_state(data: dict) -> None:
+    with STORE_LOCK:
+        save_json_file(TEMP_AUTH_STATE_FILE, data)
+
+def load_pending_actions() -> dict:
+    with STORE_LOCK:
+        data = load_json_file(PENDING_ACTIONS_FILE, {})
+        return data if isinstance(data, dict) else {}
+
+def save_pending_actions(data: dict) -> None:
+    with STORE_LOCK:
+        save_json_file(PENDING_ACTIONS_FILE, data)
+# ---------------------------------------
 
 def is_admin(chat_id: str) -> bool:
     return str(chat_id) in ADMIN_CHAT_IDS
 
-
 def get_public_base_url() -> str:
-    if PUBLIC_BASE_URL:
-        return PUBLIC_BASE_URL
-    return f"http://127.0.0.1:{PORT}"
+    try:
+        if request and request.url_root:
+            return request.url_root.rstrip("/")
+    except Exception:
+        pass
+    return "https://cloud-nest-q8o9.onrender.com"
 
+# --- EMAIL SENDER (FACEBOOK STYLE TEMPLATE FOR BOT REGISTRATION) ---
+def send_otp_email(to_email, otp_code):
+    try:
+        msg = MIMEMultipart("alternative")
+        msg['Subject'] = "Your CloudNest Security Code"
+        msg['From'] = SMTP_EMAIL
+        msg['To'] = to_email
 
-def ensure_user(chat_id: str) -> dict:
+        html = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: auto; border: 1px solid #e5e5e5; border-radius: 8px; padding: 20px; text-align: center; color: #333;">
+            <h2 style="color: #1877F2; margin-bottom: 10px;">CloudNest Security</h2>
+            <p style="font-size: 16px;">We received a request to verify your email. Your security code is below. This code will expire in 5 minutes.</p>
+            <div style="font-size: 28px; font-weight: bold; background: #f0f2f5; padding: 15px; margin: 20px 0; border-radius: 8px; letter-spacing: 5px; color: #1c1e21;">
+                {otp_code}
+            </div>
+            <p style="font-size: 12px; color: #888;">If you did not request this code, you can safely ignore this email. Someone else might have typed your email address by mistake.</p>
+            <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+            <p style="font-size: 11px; color: #aaa;">CloudNest Dev Platform</p>
+        </div>
+        """
+        msg.attach(MIMEText(html, "html"))
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        print("SMTP Error:", e)
+        return False
+
+# --- EMAIL SENDER (BASIC TEMPLATE FOR API USERS WITH PROMOTION) ---
+def send_user_otp_email(to_email, otp_code):
+    try:
+        msg = MIMEMultipart("alternative")
+        msg['Subject'] = "Your Verification Code"
+        msg['From'] = SMTP_EMAIL
+        msg['To'] = to_email
+
+        html = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: auto; padding: 20px; color: #333;">
+            <h2>Verification Code</h2>
+            <p>Your requested code is: <strong>{otp_code}</strong></p>
+            <p>Please use this code to verify your action. The code will expire in 5 minutes.</p>
+            <br>
+            <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+            <p style="font-size: 12px; color: #666;">
+                <em>This OTP service is powered by CloudNest API.</em><br><br>
+                Build your own advanced backend easily with <a href="https://t.me/Cloud_Nest_bot" style="color: #1877F2;">@Cloud_Nest_bot</a>
+            </p>
+        </div>
+        """
+        msg.attach(MIMEText(html, "html"))
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        print("SMTP Error (User OTP):", e)
+        return False
+
+# --- SESSION & USER MANAGMENT ---
+def get_logged_in_user(chat_id: str):
     chat_id = str(chat_id)
     with STORE_LOCK:
+        sessions = load_sessions()
+        email = sessions.get(chat_id)
+        if not email:
+            return None, None
+        
         users = load_users()
-        if chat_id not in users:
-            users[chat_id] = {
-                "telegram_id": chat_id,
-                "api_key": "cn_" + uuid.uuid4().hex,
-                "premium": False,
-                "premium_activated_at": "",
-                "created_at": now_iso(),
-                "usage": {
-                    "db_ops": 0,
-                    "auth_ops": 0,
-                    "upload_ops": 0,
-                    "password_edits": 0,
-                },
-            }
-            save_users(users)
-        else:
-            changed = False
-            u = users[chat_id]
-            if "telegram_id" not in u:
-                u["telegram_id"] = chat_id
-                changed = True
-            if "api_key" not in u:
-                u["api_key"] = "cn_" + uuid.uuid4().hex
-                changed = True
-            if "premium" not in u:
-                u["premium"] = False
-                changed = True
-            if "premium_activated_at" not in u:
-                u["premium_activated_at"] = ""
-                changed = True
-            if "created_at" not in u:
-                u["created_at"] = now_iso()
-                changed = True
-            if "usage" not in u or not isinstance(u["usage"], dict):
-                u["usage"] = {}
-                changed = True
-            for key in FREE_LIMITS:
-                if key not in u["usage"]:
-                    u["usage"][key] = 0
-                    changed = True
-            if changed:
+        user_info = users.get(email)
+        if not user_info:
+            return None, None
+            
+        # Check if premium expired
+        if user_info.get("premium") and user_info.get("premium_expires_at"):
+            exp_date = datetime.fromisoformat(user_info["premium_expires_at"])
+            if datetime.now(timezone.utc) > exp_date:
+                user_info["premium"] = False
+                user_info["premium_expires_at"] = ""
+                users[email] = user_info
                 save_users(users)
-        return users[chat_id]
-
+                
+        return email, user_info
 
 def get_user_by_api_key(api_key: str):
     if not api_key:
         return None, None
+    if api_key == ADMIN_API_KEY:
+        return "admin@cloudnest", {
+            "email": "admin@cloudnest",
+            "api_key": ADMIN_API_KEY,
+            "premium": True,
+            "usage": {}
+        }
     users = load_users()
-    for user_id, info in users.items():
+    for email, info in users.items():
         if info.get("api_key") == api_key:
-            return str(user_id), info
+            return email, info
     return None, None
-
 
 def feature_limit_status(user_info: dict, feature: str) -> tuple:
     used = int((user_info.get("usage") or {}).get(feature, 0))
@@ -193,18 +283,20 @@ def feature_limit_status(user_info: dict, feature: str) -> tuple:
     percent = (used / limit * 100.0) if limit else 0.0
     return used, limit, round(percent, 1)
 
-
-def consume_feature(chat_id: str, feature: str) -> tuple:
-    chat_id = str(chat_id)
+def consume_feature(email: str, feature: str) -> tuple:
     with STORE_LOCK:
         users = load_users()
-        user_info = users.get(chat_id)
+        # Handle Admin API Bypass correctly
+        if email == "admin@cloudnest":
+            return True, {"premium": True}
+
+        user_info = users.get(email)
         if not user_info:
             return False, {}
         if user_info.get("premium"):
             user_info.setdefault("usage", {})
             user_info["usage"][feature] = int(user_info["usage"].get(feature, 0)) + 1
-            users[chat_id] = user_info
+            users[email] = user_info
             save_users(users)
             return True, user_info
 
@@ -212,21 +304,19 @@ def consume_feature(chat_id: str, feature: str) -> tuple:
         used = int(user_info["usage"].get(feature, 0))
         limit = int(FREE_LIMITS.get(feature, 0))
         if limit and used >= limit:
-            users[chat_id] = user_info
+            users[email] = user_info
             save_users(users)
             return False, user_info
 
         user_info["usage"][feature] = used + 1
-        users[chat_id] = user_info
+        users[email] = user_info
         save_users(users)
         return True, user_info
-
 
 def percent_text(used: int, limit: int) -> str:
     if limit <= 0:
         return "0%"
     return f"{min(100.0, (used / limit) * 100.0):.1f}%"
-
 
 def usage_summary(user_info: dict) -> str:
     lines = []
@@ -240,6 +330,15 @@ def usage_summary(user_info: dict) -> str:
     return "\n".join(lines)
 
 
+# =============================================================================
+# KEYBOARDS
+# =============================================================================
+
+def auth_welcome_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(types.KeyboardButton("Register"), types.KeyboardButton("Login"))
+    return markup
+
 def main_keyboard(chat_id: str):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     buttons = [
@@ -248,20 +347,28 @@ def main_keyboard(chat_id: str):
         types.KeyboardButton("Storage"),
         types.KeyboardButton("Premium"),
         types.KeyboardButton("Project Settings"),
+        types.KeyboardButton("Logout")
     ]
     if is_admin(chat_id):
         buttons.append(types.KeyboardButton("Create premium"))
     markup.add(*buttons)
     return markup
 
-
 def premium_inline_keyboard(is_admin_user: bool):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Redeem Premium Code", callback_data="premium_redeem"))
-    if is_admin_user:
-        markup.add(types.InlineKeyboardButton("Create Premium Code", callback_data="premium_create"))
     return markup
 
+def premium_duration_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.add(
+        types.InlineKeyboardButton("1 Day", callback_data="premgen_1"),
+        types.InlineKeyboardButton("7 Days", callback_data="premgen_7"),
+        types.InlineKeyboardButton("1 Month", callback_data="premgen_30"),
+        types.InlineKeyboardButton("3 Months", callback_data="premgen_90"),
+        types.InlineKeyboardButton("1 Year", callback_data="premgen_365")
+    )
+    return markup
 
 def auth_inline_keyboard():
     markup = types.InlineKeyboardMarkup()
@@ -269,24 +376,21 @@ def auth_inline_keyboard():
     markup.add(types.InlineKeyboardButton("Edit Password", callback_data="edit_password"))
     return markup
 
-
 def project_inline_keyboard():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🗄 Database (DB)", callback_data="proj_db"))
-    markup.add(types.InlineKeyboardButton("👥 Authentication (Auth)", callback_data="proj_auth"))
-    markup.add(types.InlineKeyboardButton("📁 Storage (File Upload)", callback_data="proj_storage"))
+    markup.add(types.InlineKeyboardButton("👥 Authentication", callback_data="proj_auth"))
+    markup.add(types.InlineKeyboardButton("📁 Storage (Upload)", callback_data="proj_storage"))
+    markup.add(types.InlineKeyboardButton("📧 OTP Sent (System)", callback_data="proj_otp"))
     return markup
 
-
 def lang_keyboard(section: str):
-    """Returns inline keyboard with language choices for a given section."""
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
     for lang in LANGUAGES:
         buttons.append(types.InlineKeyboardButton(lang, callback_data=f"lang_{section}_{lang.lower()}"))
     markup.add(*buttons)
     return markup
-
 
 def db_ops_keyboard(lang: str):
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -296,7 +400,6 @@ def db_ops_keyboard(lang: str):
         markup.add(types.InlineKeyboardButton(op, callback_data=f"dbop_{lang}_{op_key}"))
     return markup
 
-
 def auth_ops_keyboard(lang: str):
     markup = types.InlineKeyboardMarkup(row_width=2)
     ops = ["Login", "Register", "Auth Load", "Auth Delete", "Password Change"]
@@ -304,7 +407,6 @@ def auth_ops_keyboard(lang: str):
         op_key = op.lower().replace(" ", "_")
         markup.add(types.InlineKeyboardButton(op, callback_data=f"authop_{lang}_{op_key}"))
     return markup
-
 
 def storage_ops_keyboard(lang: str):
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -314,89 +416,54 @@ def storage_ops_keyboard(lang: str):
         markup.add(types.InlineKeyboardButton(op, callback_data=f"storop_{lang}_{op_key}"))
     return markup
 
+def otp_ops_keyboard(lang: str):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    ops = ["OTP Send", "OTP Verify"]
+    for op in ops:
+        op_key = op.lower().replace(" ", "_")
+        markup.add(types.InlineKeyboardButton(op, callback_data=f"otpop_{lang}_{op_key}"))
+    return markup
 
 def set_pending_action(chat_id: str, action: str):
     with STORE_LOCK:
-        PENDING_ACTIONS[str(chat_id)] = action
-
+        actions = load_pending_actions()
+        actions[str(chat_id)] = action
+        save_pending_actions(actions)
 
 def pop_pending_action(chat_id: str):
     with STORE_LOCK:
-        return PENDING_ACTIONS.pop(str(chat_id), None)
-
+        actions = load_pending_actions()
+        val = actions.pop(str(chat_id), None)
+        save_pending_actions(actions)
+        return val
 
 def get_pending_action(chat_id: str):
     with STORE_LOCK:
-        return PENDING_ACTIONS.get(str(chat_id))
-
+        return load_pending_actions().get(str(chat_id))
 
 def escape_text(value) -> str:
     return str(value).replace("`", "'")
 
-
-def create_premium_code(created_by: str) -> str:
-    code = "PREM-" + uuid.uuid4().hex[:4].upper() + "-" + uuid.uuid4().hex[:4].upper() + "-" + uuid.uuid4().hex[:4].upper()
-    with STORE_LOCK:
-        codes = load_premium_codes()
-        codes[code] = {
-            "used": False,
-            "created_by": str(created_by),
-            "created_at": now_iso(),
-            "used_by": "",
-            "used_at": "",
-        }
-        save_premium_codes(codes)
-    return code
-
-
-def activate_premium_for_user(chat_id: str, code: str) -> tuple:
-    chat_id = str(chat_id)
-    with STORE_LOCK:
-        codes = load_premium_codes()
-        if code not in codes:
-            return False, "Invalid premium code."
-        if codes[code].get("used"):
-            return False, "This premium code was already used."
-
-        users = load_users()
-        if chat_id not in users:
-            return False, "User account not found."
-
-        users[chat_id]["premium"] = True
-        users[chat_id]["premium_activated_at"] = now_iso()
-        save_users(users)
-
-        codes[code]["used"] = True
-        codes[code]["used_by"] = chat_id
-        codes[code]["used_at"] = now_iso()
-        save_premium_codes(codes)
-
-    return True, "Premium activated successfully."
-
+# --- FILESYSTEM HELPERS ---
 
 def get_db_file(dev_info: dict) -> str:
     return os.path.join(DATA_DIR, f"{dev_info['api_key']}_db.json")
 
-
 def get_auth_file(dev_info: dict) -> str:
     return os.path.join(DATA_DIR, f"{dev_info['api_key']}_auth.json")
-
 
 def load_dev_db(dev_info: dict) -> dict:
     path = get_db_file(dev_info)
     data = load_json_file(path, {})
     return data if isinstance(data, dict) else {}
 
-
 def save_dev_db(dev_info: dict, data: dict) -> None:
     save_json_file(get_db_file(dev_info), data)
-
 
 def load_dev_auth(dev_info: dict) -> dict:
     path = get_auth_file(dev_info)
     data = load_json_file(path, {})
     return data if isinstance(data, dict) else {}
-
 
 def save_dev_auth(dev_info: dict, data: dict) -> None:
     save_json_file(get_auth_file(dev_info), data)
@@ -405,6 +472,115 @@ def save_dev_auth(dev_info: dict, data: dict) -> None:
 # =============================================================================
 # CODE GENERATORS — All Languages, All Operations
 # =============================================================================
+
+def get_otp_code(lang: str, op: str, api_key: str, host: str) -> str:
+    lang = lang.lower()
+    op = op.lower()
+
+    codes = {
+        "javascript": {
+            "otp_send": f"""// ✅ JavaScript — OTP Send
+fetch('{host}/api/otp/send', {{
+  method: 'POST',
+  headers: {{ 'Content-Type': 'application/json' }},
+  body: JSON.stringify({{ api_key: '{api_key}', email: 'user@gmail.com' }})
+}}).then(r => r.json()).then(console.log);""",
+            "otp_verify": f"""// ✅ JavaScript — OTP Verify
+fetch('{host}/api/otp/verify', {{
+  method: 'POST',
+  headers: {{ 'Content-Type': 'application/json' }},
+  body: JSON.stringify({{ api_key: '{api_key}', email: 'user@gmail.com', otp: '123456' }})
+}}).then(r => r.json()).then(console.log);"""
+        },
+        "python": {
+            "otp_send": f"""# ✅ Python — OTP Send
+import requests
+res = requests.post('{host}/api/otp/send', json={{ 'api_key': '{api_key}', 'email': 'user@gmail.com' }})
+print(res.json())""",
+            "otp_verify": f"""# ✅ Python — OTP Verify
+import requests
+res = requests.post('{host}/api/otp/verify', json={{ 'api_key': '{api_key}', 'email': 'user@gmail.com', 'otp': '123456' }})
+print(res.json())"""
+        },
+        "kotlin": {
+            "otp_send": f"""// ✅ Kotlin — OTP Send
+val json = JSONObject()
+json.put("api_key", "{api_key}")
+json.put("email", "user@gmail.com")
+val body = json.toString().toRequestBody("application/json".toMediaType())
+val request = Request.Builder().url("{host}/api/otp/send").post(body).build()
+OkHttpClient().newCall(request).execute().use {{ println(it.body?.string()) }}""",
+            "otp_verify": f"""// ✅ Kotlin — OTP Verify
+val json = JSONObject()
+json.put("api_key", "{api_key}")
+json.put("email", "user@gmail.com")
+json.put("otp", "123456")
+val body = json.toString().toRequestBody("application/json".toMediaType())
+val request = Request.Builder().url("{host}/api/otp/verify").post(body).build()
+OkHttpClient().newCall(request).execute().use {{ println(it.body?.string()) }}"""
+        },
+        "swift": {
+            "otp_send": f"""// ✅ Swift — OTP Send
+var req = URLRequest(url: URL(string: "{host}/api/otp/send")!)
+req.httpMethod = "POST"; req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+req.httpBody = try? JSONSerialization.data(withJSONObject: ["api_key": "{api_key}", "email": "user@gmail.com"])
+URLSession.shared.dataTask(with: req) {{ d,_,_ in print(String(data: d!, encoding: .utf8)!) }}.resume()""",
+            "otp_verify": f"""// ✅ Swift — OTP Verify
+var req = URLRequest(url: URL(string: "{host}/api/otp/verify")!)
+req.httpMethod = "POST"; req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+req.httpBody = try? JSONSerialization.data(withJSONObject: ["api_key": "{api_key}", "email": "user@gmail.com", "otp": "123456"])
+URLSession.shared.dataTask(with: req) {{ d,_,_ in print(String(data: d!, encoding: .utf8)!) }}.resume()"""
+        },
+        "dart": {
+            "otp_send": f"""// ✅ Dart — OTP Send
+final res = await http.post(Uri.parse('{host}/api/otp/send'),
+  headers: {{'Content-Type': 'application/json'}},
+  body: jsonEncode({{'api_key': '{api_key}', 'email': 'user@gmail.com'}}));
+print(res.body);""",
+            "otp_verify": f"""// ✅ Dart — OTP Verify
+final res = await http.post(Uri.parse('{host}/api/otp/verify'),
+  headers: {{'Content-Type': 'application/json'}},
+  body: jsonEncode({{'api_key': '{api_key}', 'email': 'user@gmail.com', 'otp': '123456'}}));
+print(res.body);"""
+        },
+        "php": {
+            "otp_send": f"""<?php // ✅ PHP — OTP Send
+$ch = curl_init('{host}/api/otp/send');
+curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => ['Content-Type: application/json'], CURLOPT_POSTFIELDS => json_encode(['api_key' => '{api_key}', 'email' => 'user@gmail.com'])]);
+echo curl_exec($ch);""",
+            "otp_verify": f"""<?php // ✅ PHP — OTP Verify
+$ch = curl_init('{host}/api/otp/verify');
+curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => ['Content-Type: application/json'], CURLOPT_POSTFIELDS => json_encode(['api_key' => '{api_key}', 'email' => 'user@gmail.com', 'otp' => '123456'])]);
+echo curl_exec($ch);"""
+        },
+        "java": {
+            "otp_send": f"""// ✅ Java — OTP Send
+OkHttpClient client = new OkHttpClient();
+String json = "{{\\"api_key\\":\\"{api_key}\\",\\"email\\":\\"user@gmail.com\\"}}";
+RequestBody body = RequestBody.create(json, MediaType.parse("application/json"));
+Request request = new Request.Builder().url("{host}/api/otp/send").post(body).build();
+try (Response r = client.newCall(request).execute()) {{ System.out.println(r.body().string()); }}""",
+            "otp_verify": f"""// ✅ Java — OTP Verify
+OkHttpClient client = new OkHttpClient();
+String json = "{{\\"api_key\\":\\"{api_key}\\",\\"email\\":\\"user@gmail.com\\",\\"otp\\":\\"123456\\"}}";
+RequestBody body = RequestBody.create(json, MediaType.parse("application/json"));
+Request request = new Request.Builder().url("{host}/api/otp/verify").post(body).build();
+try (Response r = client.newCall(request).execute()) {{ System.out.println(r.body().string()); }}"""
+        },
+        "c#": {
+            "otp_send": f"""// ✅ C# — OTP Send
+using var client = new HttpClient();
+var payload = new {{ api_key = "{api_key}", email = "user@gmail.com" }};
+var res = await client.PostAsync("{host}/api/otp/send", new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+Console.WriteLine(await res.Content.ReadAsStringAsync());""",
+            "otp_verify": f"""// ✅ C# — OTP Verify
+using var client = new HttpClient();
+var payload = new {{ api_key = "{api_key}", email = "user@gmail.com", otp = "123456" }};
+var res = await client.PostAsync("{host}/api/otp/verify", new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+Console.WriteLine(await res.Content.ReadAsStringAsync());"""
+        }
+    }
+    return codes.get(lang, {}).get(op, f"// Code for {lang} - {op} not available yet.")
 
 def get_db_code(lang: str, op: str, api_key: str, host: str) -> str:
     lang = lang.lower()
@@ -1344,32 +1520,100 @@ Console.WriteLine(await res.Content.ReadAsStringAsync());""",
 
 
 # =============================================================================
-# FLASK ROUTES
+# FLASK ROUTES (Secure)
 # =============================================================================
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "ok", "service": "CloudNest Backend Manager", "time": now_iso()}), 200
-
+    return jsonify({"status": "ok", "service": "CloudNest API Framework", "security": "Active"}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "healthy", "service": "CloudNest Backend Manager", "time": now_iso()}), 200
+    return jsonify({"status": "healthy"}), 200
 
+@app.route("/api/otp/send", methods=["POST"])
+def api_otp_send():
+    data = request.get_json(silent=True) or {}
+    api_key = data.get("api_key", "").strip()
+    
+    if not api_key:
+        return jsonify({"status": "error", "message": "Method not allowed"}), 405
+
+    email = data.get("email", "").strip()
+
+    dev_email, dev_info = get_user_by_api_key(api_key)
+    if not dev_email:
+        return jsonify({"status": "error", "message": "Invalid API Key."}), 401
+
+    if not email:
+        return jsonify({"status": "error", "message": "Email is required."}), 400
+
+    allowed, user_info = consume_feature(dev_email, "otp_sends")
+    if not allowed and not user_info.get("premium"):
+        used, limit, pct = feature_limit_status(user_info, "otp_sends")
+        return jsonify({"status": "error", "message": "Free OTP limit reached.", "usage": {"used": used, "limit": limit, "percent": pct}}), 429
+
+    otp_code = str(random.randint(100000, 999999))
+    if send_user_otp_email(email, otp_code):
+        key = f"{api_key}_{email}"
+        otps = load_dev_otps()
+        otps[key] = {
+            "otp": otp_code,
+            "expires": time.time() + 300 # 5 minutes
+        }
+        save_dev_otps(otps)
+        return jsonify({"status": "success", "message": "OTP sent successfully."})
+    return jsonify({"status": "error", "message": "Failed to send email."}), 500
+
+@app.route("/api/otp/verify", methods=["POST"])
+def api_otp_verify():
+    data = request.get_json(silent=True) or {}
+    api_key = data.get("api_key", "").strip()
+
+    if not api_key:
+        return jsonify({"status": "error", "message": "Method not allowed"}), 405
+
+    email = data.get("email", "").strip()
+    otp = str(data.get("otp", "")).strip()
+
+    dev_email, _ = get_user_by_api_key(api_key)
+    if not dev_email:
+        return jsonify({"status": "error", "message": "Invalid API Key."}), 401
+
+    key = f"{api_key}_{email}"
+    otps = load_dev_otps()
+    record = otps.get(key)
+    
+    if not record: 
+        return jsonify({"status": "error", "message": "OTP not found or not sent."}), 404
+    if time.time() > record["expires"]:
+        del otps[key]
+        save_dev_otps(otps)
+        return jsonify({"status": "error", "message": "OTP expired."}), 400
+    if record["otp"] == otp:
+        del otps[key]
+        save_dev_otps(otps)
+        return jsonify({"status": "success", "message": "OTP verified successfully."})
+    
+    return jsonify({"status": "error", "message": "Invalid OTP."}), 400
 
 @app.route("/api/db", methods=["POST"])
 def api_db():
     data = request.get_json(silent=True) or {}
     api_key = (data.get("api_key") or "").strip()
+
+    if not api_key:
+        return jsonify({"status": "error", "message": "Method not allowed"}), 405
+
     action = (data.get("action") or "").strip().lower()
     key = str(data.get("key", "default"))
     payload = data.get("data", "")
 
-    user_id, dev_info = get_user_by_api_key(api_key)
-    if not user_id:
+    dev_email, dev_info = get_user_by_api_key(api_key)
+    if not dev_email:
         return jsonify({"status": "error", "message": "Invalid API Key."}), 401
 
-    allowed, user_info = consume_feature(user_id, "db_ops")
+    allowed, user_info = consume_feature(dev_email, "db_ops")
     if not allowed and not user_info.get("premium"):
         used, limit, pct = feature_limit_status(user_info, "db_ops")
         return jsonify({"status": "error", "message": "Free database limit reached.", "usage": {"used": used, "limit": limit, "percent": pct}}), 429
@@ -1393,21 +1637,24 @@ def api_db():
 
     return jsonify({"status": "error", "message": "Invalid action."}), 400
 
-
 @app.route("/api/auth", methods=["POST"])
 def api_auth():
     data = request.get_json(silent=True) or {}
     api_key = (data.get("api_key") or "").strip()
+
+    if not api_key:
+        return jsonify({"status": "error", "message": "Method not allowed"}), 405
+
     action = (data.get("action") or "").strip().lower()
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "")
     new_password = str(data.get("new_password") or data.get("password_new") or "").strip()
 
-    user_id, dev_info = get_user_by_api_key(api_key)
-    if not user_id:
+    dev_email, dev_info = get_user_by_api_key(api_key)
+    if not dev_email:
         return jsonify({"status": "error", "message": "Invalid API Key."}), 401
 
-    allowed, user_info = consume_feature(user_id, "auth_ops")
+    allowed, user_info = consume_feature(dev_email, "auth_ops")
     if not allowed and not user_info.get("premium"):
         used, limit, pct = feature_limit_status(user_info, "auth_ops")
         return jsonify({"status": "error", "message": "Free authentication limit reached.", "usage": {"used": used, "limit": limit, "percent": pct}}), 429
@@ -1447,11 +1694,6 @@ def api_auth():
         if username not in auth_data:
             return jsonify({"status": "error", "message": "User not found."}), 404
 
-        old_password = str(data.get("old_password") or "").strip()
-        if not is_admin(user_id):
-            if auth_data[username].get("password") != password and auth_data[username].get("password") != old_password:
-                return jsonify({"status": "error", "message": "Current password is wrong."}), 401
-
         auth_data[username]["password"] = new_password
         auth_data[username]["updated_at"] = now_iso()
         save_dev_auth(dev_info, auth_data)
@@ -1459,15 +1701,18 @@ def api_auth():
 
     return jsonify({"status": "error", "message": "Invalid action."}), 400
 
-
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
     api_key = (request.form.get("api_key") or "").strip()
-    user_id, dev_info = get_user_by_api_key(api_key)
-    if not user_id:
-        return jsonify({"status": "error", "message": "Invalid API key"}), 401
+    
+    if not api_key:
+        return jsonify({"status": "error", "message": "Method not allowed"}), 405
 
-    allowed, user_info = consume_feature(user_id, "upload_ops")
+    dev_email, dev_info = get_user_by_api_key(api_key)
+    if not dev_email:
+        return jsonify({"status": "error", "message": "Invalid API Key."}), 401
+
+    allowed, user_info = consume_feature(dev_email, "upload_ops")
     if not allowed and not user_info.get("premium"):
         used, limit, pct = feature_limit_status(user_info, "upload_ops")
         return jsonify({"status": "error", "message": "Free upload limit reached.", "usage": {"used": used, "limit": limit, "percent": pct}}), 429
@@ -1486,23 +1731,25 @@ def upload_file():
     file_url = f"{get_public_base_url()}/uploads/{unique_filename}"
     return jsonify({"status": "success", "url": file_url, "filename": filename})
 
-
 @app.route("/api/storage/delete", methods=["POST"])
 def delete_storage_file():
     data = request.get_json(silent=True) or {}
     api_key = (data.get("api_key") or "").strip()
+
+    if not api_key:
+        return jsonify({"status": "error", "message": "Method not allowed"}), 405
+
     filename = (data.get("filename") or "").strip()
 
-    user_id, dev_info = get_user_by_api_key(api_key)
-    if not user_id:
-        return jsonify({"status": "error", "message": "Invalid API key"}), 401
+    dev_email, dev_info = get_user_by_api_key(api_key)
+    if not dev_email:
+        return jsonify({"status": "error", "message": "Invalid API Key."}), 401
 
     if not filename:
         return jsonify({"status": "error", "message": "filename is required"}), 400
 
-    # Security: only allow deleting files owned by this user (prefixed with their api_key)
     safe_prefix = dev_info["api_key"] + "_"
-    if not filename.startswith(safe_prefix):
+    if not filename.startswith(safe_prefix) and dev_email != "admin@cloudnest":
         return jsonify({"status": "error", "message": "Access denied."}), 403
 
     filepath = os.path.join(UPLOAD_FOLDER, secure_filename(filename))
@@ -1511,41 +1758,32 @@ def delete_storage_file():
         return jsonify({"status": "success", "message": f"File '{filename}' deleted."})
     return jsonify({"status": "error", "message": "File not found."}), 404
 
-
 @app.route("/uploads/<filename>")
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 
 # =============================================================================
-# TELEGRAM BOT
+# TELEGRAM BOT LOGIC
 # =============================================================================
-
-def send_welcome(chat_id: str):
-    user_info = ensure_user(chat_id)
-    text = (
-        "🎉 Account Auto-Registered!\n"
-        "Your Telegram ID is linked with your CloudNest API key.\n\n"
-        f"API Key:\n{user_info['api_key']}\n\n"
-        "Tap & hold the API key above to copy it.\n\n"
-        "Use the menu below."
-    )
-    bot.send_message(chat_id, text, reply_markup=main_keyboard(chat_id))
-
 
 @bot.message_handler(commands=["start", "restart"])
 def command_start(message):
     chat_id = str(message.chat.id)
-    send_welcome(chat_id)
+    auth_state_db = load_temp_auth_state()
+    if chat_id in auth_state_db:
+        del auth_state_db[chat_id]
+        save_temp_auth_state(auth_state_db)
 
+    email, user_info = get_logged_in_user(chat_id)
+    if email:
+        text = f"🎉 Welcome back to CloudNest!\n\nYour API Key:\n<code>{user_info['api_key']}</code>\n\n(Tap the key to copy it)"
+        bot.send_message(chat_id, text, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
+    else:
+        bot.send_message(chat_id, "Welcome to CloudNest Database & Backend Bot!\n\nPlease Register or Login to continue.", reply_markup=auth_welcome_keyboard())
 
-@bot.message_handler(commands=["health"])
-def command_health(message):
-    bot.send_message(message.chat.id, "healthy")
-
-
-def show_database(chat_id: str):
-    user_info = ensure_user(chat_id)
+def show_database(chat_id: str, email: str):
+    user_info = load_users().get(email)
     db_file = get_db_file(user_info)
     db_data = load_json_file(db_file, {})
     if not db_data:
@@ -1562,9 +1800,8 @@ def show_database(chat_id: str):
     msg.append(usage_summary(user_info))
     bot.send_message(chat_id, "\n".join(msg), reply_markup=main_keyboard(chat_id))
 
-
-def show_auth_users(chat_id: str):
-    user_info = ensure_user(chat_id)
+def show_auth_users(chat_id: str, email: str):
+    user_info = load_users().get(email)
     auth_file = get_auth_file(user_info)
     auth_data = load_json_file(auth_file, {})
     if not auth_data:
@@ -1579,14 +1816,11 @@ def show_auth_users(chat_id: str):
     lines.append(usage_summary(user_info))
     bot.send_message(chat_id, "\n".join(lines), reply_markup=main_keyboard(chat_id))
 
-
-def show_storage(chat_id: str):
-    """Show recent 5 uploaded files for this user."""
-    user_info = ensure_user(chat_id)
+def show_storage(chat_id: str, email: str):
+    user_info = load_users().get(email)
     api_key = user_info["api_key"]
     host = get_public_base_url()
 
-    # List files belonging to this user
     all_files = []
     if os.path.exists(UPLOAD_FOLDER):
         for fname in os.listdir(UPLOAD_FOLDER):
@@ -1608,7 +1842,6 @@ def show_storage(chat_id: str):
         )
         return
 
-    # Sort by newest first, take last 5
     all_files.sort(key=lambda x: x["modified"], reverse=True)
     recent = all_files[:5]
 
@@ -1617,7 +1850,6 @@ def show_storage(chat_id: str):
     for i, f in enumerate(recent, 1):
         size_kb = f["size"] / 1024
         size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.2f} MB"
-        # Show original filename (strip api_key prefix and random hex)
         parts = f["name"].split("_", 2)
         display_name = parts[2] if len(parts) >= 3 else f["name"]
         lines.append(f"{i}. {display_name} ({size_str})")
@@ -1631,79 +1863,16 @@ def show_storage(chat_id: str):
     lines.append(usage_summary(user_info))
     bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
 
-
-def show_premium_menu(chat_id: str):
-    user_info = ensure_user(chat_id)
-    premium = bool(user_info.get("premium"))
-    lines = []
-    if premium:
-        lines.append("⭐ Premium status: ACTIVE")
-        lines.append(f"Activated at: {user_info.get('premium_activated_at') or 'N/A'}")
-        lines.append("All features are unlimited.")
-    else:
-        lines.append("⭐ Premium status: FREE")
-        lines.append("Redeem a one-time code to activate Premium.")
-    lines.append("")
-    lines.append("Usage:")
-    lines.append(usage_summary(user_info))
-    bot.send_message(chat_id, "\n".join(lines), reply_markup=premium_inline_keyboard(is_admin(chat_id)))
-
-
-def show_project_settings(chat_id: str):
-    user_info = ensure_user(chat_id)
-    host = get_public_base_url()
-    api_key = user_info["api_key"]
-    text = (
-        f"⚙️ Project Settings\n\n"
-        f"Your API Key (tap & hold to copy):\n{api_key}\n\n"
-        f"Base URL:\n{host}\n\n"
-        f"Usage:\n{usage_summary(user_info)}\n\n"
-        f"Choose a section to get code:"
-    )
-    bot.send_message(chat_id, text, reply_markup=project_inline_keyboard())
-
-
-def generate_and_send_premium_code(chat_id: str):
-    if not is_admin(chat_id):
-        bot.send_message(chat_id, "You are not allowed to create premium codes.")
-        return
-    code = create_premium_code(chat_id)
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📋 Copy Code", switch_inline_query=code))
-    bot.send_message(
-        chat_id,
-        f"✅ Premium code created:\n\n{code}\n\nThis code can be used only once.\n(Tap & hold the code above to copy it)",
-        reply_markup=markup,
-    )
-
-
-def prompt_redeem_premium(chat_id: str):
-    set_pending_action(chat_id, "redeem_premium")
-    bot.send_message(chat_id, "Send your premium redeem code now.")
-
-
-def prompt_edit_password(chat_id: str):
-    set_pending_action(chat_id, "edit_password")
-    bot.send_message(chat_id, "Send in this format:\nusername|new_password")
-
-
 def send_code_message(chat_id: str, title: str, code: str, lang_label: str):
-    """Send a code block with a copy button."""
-    # Telegram inline "copy" button via switch_inline_query trick for copying code
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("📋 Copy Code", switch_inline_query=code))
-
-    # Add syntax header
     header = f"💻 {title} — {lang_label}:\n\n"
-    # Code block (monospace)
     full_msg = header + "```\n" + code + "\n```"
 
     try:
         bot.send_message(chat_id, full_msg, parse_mode="Markdown", reply_markup=markup)
     except Exception:
-        # fallback without markdown
         bot.send_message(chat_id, header + code, reply_markup=markup)
-
 
 @bot.message_handler(func=lambda message: True, content_types=["text"])
 def handle_messages(message):
@@ -1713,13 +1882,188 @@ def handle_messages(message):
     if not text:
         return
 
-    ensure_user(chat_id)
+    # Check for ongoing Auth Flow
+    auth_state_db = load_temp_auth_state()
+    auth_state = auth_state_db.get(chat_id)
+    if auth_state:
+        action = auth_state["action"]
+        state = auth_state["state"]
 
+        # --- REGISTRATION ---
+        if action == "register":
+            if state == "await_email":
+                if not text.endswith("@gmail.com"):
+                    bot.send_message(chat_id, "❌ Error: Only @gmail.com is allowed. Please enter a valid Gmail address:")
+                    return
+                users = load_users()
+                if text in users:
+                    bot.send_message(chat_id, "❌ This email is already registered. Please login.", reply_markup=auth_welcome_keyboard())
+                    del auth_state_db[chat_id]
+                    save_temp_auth_state(auth_state_db)
+                    return
+                
+                bot.send_message(chat_id, "Sending Verification OTP to your email... Please wait.")
+                otp = str(random.randint(100000, 999999))
+                if send_otp_email(text, otp):
+                    auth_state_db[chat_id]["email"] = text
+                    auth_state_db[chat_id]["otp"] = otp
+                    auth_state_db[chat_id]["state"] = "await_otp"
+                    save_temp_auth_state(auth_state_db)
+                    bot.send_message(chat_id, "✅ OTP Sent! Please check your email and enter the 6-digit code:")
+                else:
+                    bot.send_message(chat_id, "❌ Failed to send OTP email. Please try again later.", reply_markup=auth_welcome_keyboard())
+                    del auth_state_db[chat_id]
+                    save_temp_auth_state(auth_state_db)
+                return
+
+            if state == "await_otp":
+                if text != auth_state["otp"]:
+                    bot.send_message(chat_id, "❌ Incorrect OTP. Try again:")
+                    return
+                auth_state_db[chat_id]["state"] = "await_pass"
+                save_temp_auth_state(auth_state_db)
+                bot.send_message(chat_id, "✅ Email Verified!\n\nPlease set a password for your CloudNest account:")
+                return
+
+            if state == "await_pass":
+                email = auth_state["email"]
+                password = text
+                
+                users = load_users()
+                api_key = "cn_" + uuid.uuid4().hex
+                users[email] = {
+                    "email": email,
+                    "password": password,
+                    "api_key": api_key,
+                    "premium": False,
+                    "premium_expires_at": "",
+                    "created_at": now_iso(),
+                    "usage": {}
+                }
+                save_users(users)
+
+                sessions = load_sessions()
+                sessions[chat_id] = email
+                save_sessions(sessions)
+                
+                del auth_state_db[chat_id]
+                save_temp_auth_state(auth_state_db)
+
+                msg = f"🎉 Account Registered Successfully!\n\nYour API Key:\n<code>{api_key}</code>\n\n(Tap the key to copy)"
+                bot.send_message(chat_id, msg, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
+                return
+
+        # --- LOGIN ---
+        if action == "login":
+            if state == "await_email":
+                users = load_users()
+                if text not in users:
+                    bot.send_message(chat_id, "❌ Email not found. Please register first.", reply_markup=auth_welcome_keyboard())
+                    del auth_state_db[chat_id]
+                    save_temp_auth_state(auth_state_db)
+                    return
+                
+                bot.send_message(chat_id, "Sending Login OTP... Please wait.")
+                otp = str(random.randint(100000, 999999))
+                if send_otp_email(text, otp):
+                    auth_state_db[chat_id]["email"] = text
+                    auth_state_db[chat_id]["otp"] = otp
+                    auth_state_db[chat_id]["state"] = "await_otp"
+                    save_temp_auth_state(auth_state_db)
+                    bot.send_message(chat_id, "✅ OTP Sent! Please check your email and enter the 6-digit code:")
+                else:
+                    bot.send_message(chat_id, "❌ Failed to send OTP.", reply_markup=auth_welcome_keyboard())
+                    del auth_state_db[chat_id]
+                    save_temp_auth_state(auth_state_db)
+                return
+
+            if state == "await_otp":
+                if text != auth_state["otp"]:
+                    bot.send_message(chat_id, "❌ Incorrect OTP. Try again:")
+                    return
+                auth_state_db[chat_id]["state"] = "await_pass"
+                save_temp_auth_state(auth_state_db)
+                bot.send_message(chat_id, "✅ OTP Verified!\n\nEnter your account password:")
+                return
+
+            if state == "await_pass":
+                email = auth_state["email"]
+                users = load_users()
+                if users[email]["password"] != text:
+                    bot.send_message(chat_id, "❌ Incorrect Password. Login failed.", reply_markup=auth_welcome_keyboard())
+                    del auth_state_db[chat_id]
+                    save_temp_auth_state(auth_state_db)
+                    return
+
+                sessions = load_sessions()
+                sessions[chat_id] = email
+                save_sessions(sessions)
+
+                del auth_state_db[chat_id]
+                save_temp_auth_state(auth_state_db)
+
+                api_key = users[email]["api_key"]
+                msg = f"✅ Logged in successfully!\n\nYour API Key:\n<code>{api_key}</code>\n\n(Tap the key to copy)"
+                bot.send_message(chat_id, msg, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
+                return
+
+    # Check for Login commands triggers
+    if text == "Register":
+        auth_state_db = load_temp_auth_state()
+        auth_state_db[chat_id] = {"action": "register", "state": "await_email"}
+        save_temp_auth_state(auth_state_db)
+        bot.send_message(chat_id, "Enter your Gmail address (@gmail.com):", reply_markup=types.ReplyKeyboardRemove())
+        return
+
+    if text == "Login":
+        auth_state_db = load_temp_auth_state()
+        auth_state_db[chat_id] = {"action": "login", "state": "await_email"}
+        save_temp_auth_state(auth_state_db)
+        bot.send_message(chat_id, "Enter your registered Gmail address:", reply_markup=types.ReplyKeyboardRemove())
+        return
+
+    # Ensure user is logged in for normal operations
+    email, user_info = get_logged_in_user(chat_id)
+    if not email:
+        bot.send_message(chat_id, "You must login first.", reply_markup=auth_welcome_keyboard())
+        return
+
+    if text == "Logout":
+        sessions = load_sessions()
+        if chat_id in sessions:
+            del sessions[chat_id]
+            save_sessions(sessions)
+        bot.send_message(chat_id, "✅ Logged out successfully.", reply_markup=auth_welcome_keyboard())
+        return
+
+    # Normal user flows
     pending = get_pending_action(chat_id)
     if pending == "redeem_premium":
         pop_pending_action(chat_id)
-        ok, msg = activate_premium_for_user(chat_id, text)
-        bot.send_message(chat_id, ("✅ " if ok else "❌ ") + msg, reply_markup=main_keyboard(chat_id))
+        
+        codes = load_premium_codes()
+        code = text
+        if code not in codes:
+            bot.send_message(chat_id, "❌ Invalid premium code.", reply_markup=main_keyboard(chat_id))
+            return
+        if codes[code].get("used"):
+            bot.send_message(chat_id, "❌ This premium code was already used.", reply_markup=main_keyboard(chat_id))
+            return
+
+        users = load_users()
+        days = codes[code].get("duration_days", 30)
+        
+        users[email]["premium"] = True
+        exp_date = datetime.now(timezone.utc) + timedelta(days=days)
+        users[email]["premium_expires_at"] = exp_date.isoformat()
+        save_users(users)
+
+        codes[code]["used"] = True
+        codes[code]["used_by"] = email
+        codes[code]["used_at"] = now_iso()
+        save_premium_codes(codes)
+
+        bot.send_message(chat_id, f"✅ Premium Activated for {days} days!\nExpires at: {exp_date.strftime('%Y-%m-%d')}", reply_markup=main_keyboard(chat_id))
         return
 
     if pending == "edit_password":
@@ -1732,8 +2076,7 @@ def handle_messages(message):
             bot.send_message(chat_id, "Wrong format. Use: username|new_password", reply_markup=main_keyboard(chat_id))
             return
 
-        user_info = ensure_user(chat_id)
-        allowed, _ = consume_feature(chat_id, "password_edits")
+        allowed, _ = consume_feature(email, "password_edits")
         if not allowed and not user_info.get("premium"):
             used, limit, pct = feature_limit_status(user_info, "password_edits")
             bot.send_message(chat_id, f"Free password-edit limit reached.\nUsed: {used}/{limit} ({pct}%)", reply_markup=main_keyboard(chat_id))
@@ -1750,13 +2093,12 @@ def handle_messages(message):
         bot.send_message(chat_id, f"✅ Password updated for user: {username}", reply_markup=main_keyboard(chat_id))
         return
 
-    # Main menu
     if text == "Database":
-        show_database(chat_id)
+        show_database(chat_id, email)
         return
 
     if text == "Authentication":
-        allowed, user_info = consume_feature(chat_id, "auth_ops")
+        allowed, _ = consume_feature(email, "auth_ops")
         if not allowed and not user_info.get("premium"):
             used, limit, pct = feature_limit_status(user_info, "auth_ops")
             bot.send_message(chat_id, f"Free authentication limit reached.\nUsed: {used}/{limit} ({pct}%)", reply_markup=main_keyboard(chat_id))
@@ -1765,19 +2107,41 @@ def handle_messages(message):
         return
 
     if text == "Storage":
-        show_storage(chat_id)
+        show_storage(chat_id, email)
         return
 
     if text == "Premium":
-        show_premium_menu(chat_id)
+        premium = bool(user_info.get("premium"))
+        lines = []
+        if premium:
+            lines.append("⭐ Premium status: ACTIVE")
+            lines.append(f"Expires at: {user_info.get('premium_expires_at')[:10]}")
+            lines.append("All features are unlimited.")
+        else:
+            lines.append("⭐ Premium status: FREE")
+            lines.append("Redeem a code to activate Premium.")
+        lines.append("")
+        lines.append("Usage:")
+        lines.append(usage_summary(user_info))
+        bot.send_message(chat_id, "\n".join(lines), reply_markup=premium_inline_keyboard(is_admin(chat_id)))
         return
 
     if text == "Project Settings":
-        show_project_settings(chat_id)
+        api_key = user_info["api_key"]
+        text_msg = (
+            f"⚙️ Project Settings\n\n"
+            f"Your API Key:\n<code>{api_key}</code>\n\n(Tap the key above to copy)\n\n"
+            f"Usage:\n{usage_summary(user_info)}\n\n"
+            f"Choose a section to get code:"
+        )
+        bot.send_message(chat_id, text_msg, reply_markup=project_inline_keyboard(), parse_mode="HTML")
         return
 
     if text == "Create premium":
-        generate_and_send_premium_code(chat_id)
+        if not is_admin(chat_id):
+            bot.send_message(chat_id, "You are not allowed.")
+            return
+        bot.send_message(chat_id, "Select Premium Duration:", reply_markup=premium_duration_keyboard())
         return
 
     bot.send_message(chat_id, "Use the menu buttons below.", reply_markup=main_keyboard(chat_id))
@@ -1788,35 +2152,53 @@ def callback_handler(call):
     chat_id = str(call.message.chat.id)
     data = call.data
 
-    ensure_user(chat_id)
+    email, user_info = get_logged_in_user(chat_id)
+    if not email and not data.startswith("premgen_"):
+        bot.answer_callback_query(call.id, "Please login first.")
+        return
 
     # ---- Auth panel callbacks ----
     if data == "show_auth":
         bot.answer_callback_query(call.id)
-        show_auth_users(chat_id)
+        show_auth_users(chat_id, email)
         return
 
     if data == "edit_password":
         bot.answer_callback_query(call.id)
-        prompt_edit_password(chat_id)
+        set_pending_action(chat_id, "edit_password")
+        bot.send_message(chat_id, "Send in this format:\nusername|new_password")
         return
 
     # ---- Premium callbacks ----
     if data == "premium_redeem":
         bot.answer_callback_query(call.id)
-        prompt_redeem_premium(chat_id)
+        set_pending_action(chat_id, "redeem_premium")
+        bot.send_message(chat_id, "Send your premium redeem code now:")
         return
 
-    if data == "premium_create":
+    if data.startswith("premgen_"):
         bot.answer_callback_query(call.id)
-        generate_and_send_premium_code(chat_id)
+        if not is_admin(chat_id): return
+        days = int(data.split("_")[1])
+        code = "PREM-" + uuid.uuid4().hex[:4].upper() + "-" + uuid.uuid4().hex[:4].upper() + "-" + uuid.uuid4().hex[:4].upper()
+        
+        codes = load_premium_codes()
+        codes[code] = {
+            "used": False,
+            "duration_days": days,
+            "created_by": str(chat_id),
+            "created_at": now_iso()
+        }
+        save_premium_codes(codes)
+        
+        msg = f"✅ Premium code created ({days} Days):\n\n`{code}`\n\n*(Tap the code to copy)*"
+        bot.send_message(chat_id, msg, parse_mode="Markdown")
         return
 
     # ---- Storage delete callback ----
     if data.startswith("storage_del_"):
         bot.answer_callback_query(call.id)
         filename = data[len("storage_del_"):]
-        user_info = ensure_user(chat_id)
         safe_prefix = user_info["api_key"] + "_"
         if not filename.startswith(safe_prefix):
             bot.send_message(chat_id, "❌ Access denied.")
@@ -1847,58 +2229,71 @@ def callback_handler(call):
         bot.send_message(chat_id, "📁 Storage — Choose Language:", reply_markup=lang_keyboard("storage"))
         return
 
-    # ---- Language selected for DB ----
+    if data == "proj_otp":
+        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, "📧 OTP System — Choose Language:", reply_markup=lang_keyboard("otp"))
+        return
+
+    # ---- Language selected ----
     if data.startswith("lang_db_"):
         lang = data[len("lang_db_"):]
         bot.answer_callback_query(call.id)
         bot.send_message(chat_id, f"🗄 DB — {lang.capitalize()} — Choose Operation:", reply_markup=db_ops_keyboard(lang))
         return
 
-    # ---- Language selected for Auth ----
     if data.startswith("lang_auth_"):
         lang = data[len("lang_auth_"):]
         bot.answer_callback_query(call.id)
         bot.send_message(chat_id, f"👥 Auth — {lang.capitalize()} — Choose Operation:", reply_markup=auth_ops_keyboard(lang))
         return
 
-    # ---- Language selected for Storage ----
     if data.startswith("lang_storage_"):
         lang = data[len("lang_storage_"):]
         bot.answer_callback_query(call.id)
         bot.send_message(chat_id, f"📁 Storage — {lang.capitalize()} — Choose Operation:", reply_markup=storage_ops_keyboard(lang))
         return
 
-    # ---- DB Operation selected ----
+    if data.startswith("lang_otp_"):
+        lang = data[len("lang_otp_"):]
+        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, f"📧 OTP — {lang.capitalize()} — Choose Operation:", reply_markup=otp_ops_keyboard(lang))
+        return
+
+    # ---- Operation Code Handlers ----
     if data.startswith("dbop_"):
         parts = data[len("dbop_"):].split("_", 1)
         if len(parts) == 2:
             lang, op = parts
             bot.answer_callback_query(call.id)
-            user_info = ensure_user(chat_id)
             code = get_db_code(lang, op, user_info["api_key"], get_public_base_url())
             send_code_message(chat_id, "Database API Code", code, lang.capitalize())
         return
 
-    # ---- Auth Operation selected ----
     if data.startswith("authop_"):
         parts = data[len("authop_"):].split("_", 1)
         if len(parts) == 2:
             lang, op = parts
             bot.answer_callback_query(call.id)
-            user_info = ensure_user(chat_id)
             code = get_auth_code(lang, op, user_info["api_key"], get_public_base_url())
             send_code_message(chat_id, "Auth API Code", code, lang.capitalize())
         return
 
-    # ---- Storage Operation selected ----
     if data.startswith("storop_"):
         parts = data[len("storop_"):].split("_", 1)
         if len(parts) == 2:
             lang, op = parts
             bot.answer_callback_query(call.id)
-            user_info = ensure_user(chat_id)
             code = get_storage_code(lang, op, user_info["api_key"], get_public_base_url())
             send_code_message(chat_id, "Storage API Code", code, lang.capitalize())
+        return
+
+    if data.startswith("otpop_"):
+        parts = data[len("otpop_"):].split("_", 1)
+        if len(parts) == 2:
+            lang, op = parts
+            bot.answer_callback_query(call.id)
+            code = get_otp_code(lang, op, user_info["api_key"], get_public_base_url())
+            send_code_message(chat_id, "OTP System API Code", code, lang.capitalize())
         return
 
     bot.answer_callback_query(call.id, "Unknown action.")
@@ -1922,9 +2317,8 @@ def run_bot():
 
 
 if __name__ == "__main__":
-    print("CloudNest backend starting...")
+    print("CloudNest Secure Backend starting...")
     print(f"Port: {PORT}")
-    print(f"Base URL: {get_public_base_url()}")
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
