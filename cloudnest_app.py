@@ -44,11 +44,6 @@ USER_DATA_FILE = os.path.join(DATA_DIR, "users.json")
 PREMIUM_CODES_FILE = os.path.join(DATA_DIR, "premium_codes.json")
 SESSION_FILE = os.path.join(DATA_DIR, "sessions.json")
 
-# NEW FILES FOR PERSISTING DATA
-DEV_OTPS_FILE = os.path.join(DATA_DIR, "dev_otps.json")
-TEMP_AUTH_STATE_FILE = os.path.join(DATA_DIR, "temp_auth_state.json")
-PENDING_ACTIONS_FILE = os.path.join(DATA_DIR, "pending_actions.json")
-
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -57,19 +52,13 @@ app = Flask(__name__)
 CORS(app)
 
 # =============================================================================
-# STORAGE / LOCKS & MEMORY CACHE (FIXED DATA RESET ISSUE)
+# STORAGE / LOCKS
 # =============================================================================
 
 STORE_LOCK = threading.RLock()
-FILE_LOCKS = {}
-FILE_LOCKS_LOCK = threading.Lock()
-MEMORY_CACHE = {}
-
-def get_file_lock(path: str):
-    with FILE_LOCKS_LOCK:
-        if path not in FILE_LOCKS:
-            FILE_LOCKS[path] = threading.RLock()
-        return FILE_LOCKS[path]
+PENDING_ACTIONS = {}
+TEMP_AUTH_STATE = {}
+DEV_OTPS = {}  # Store Developer OTPs temporarily
 
 FREE_LIMITS = {
     "db_ops": 1073741824,      # 1 GB (per month)
@@ -96,34 +85,20 @@ LANGUAGES = ["JavaScript", "Python", "Kotlin", "Swift", "Dart", "PHP", "Java", "
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-# FIXED: Added Memory Cache and File Locks to prevent Cron-job Data Wipes
 def load_json_file(path: str, default):
-    lock = get_file_lock(path)
-    with lock:
-        if not os.path.exists(path):
-            if path not in MEMORY_CACHE:
-                MEMORY_CACHE[path] = default
-            return MEMORY_CACHE[path]
-        try:
+    try:
+        if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                MEMORY_CACHE[path] = data
-                return data
-        except Exception as e:
-            # If file is corrupted by concurrent access, return data from RAM memory
-            return MEMORY_CACHE.get(path, default)
+                return json.load(f)
+    except Exception:
+        pass
+    return default
 
 def save_json_file(path: str, data) -> None:
-    lock = get_file_lock(path)
-    with lock:
-        MEMORY_CACHE[path] = data # Update RAM first
-        tmp_path = f"{path}.tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-            os.replace(tmp_path, path)
-        except Exception as e:
-            pass
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    os.replace(tmp_path, path)
 
 def load_users() -> dict:
     with STORE_LOCK:
@@ -152,43 +127,24 @@ def save_premium_codes(codes: dict) -> None:
     with STORE_LOCK:
         save_json_file(PREMIUM_CODES_FILE, codes)
 
-def load_dev_otps() -> dict:
-    with STORE_LOCK:
-        data = load_json_file(DEV_OTPS_FILE, {})
-        return data if isinstance(data, dict) else {}
-
-def save_dev_otps(data: dict) -> None:
-    with STORE_LOCK:
-        save_json_file(DEV_OTPS_FILE, data)
-
-def load_temp_auth_state() -> dict:
-    with STORE_LOCK:
-        data = load_json_file(TEMP_AUTH_STATE_FILE, {})
-        return data if isinstance(data, dict) else {}
-
-def save_temp_auth_state(data: dict) -> None:
-    with STORE_LOCK:
-        save_json_file(TEMP_AUTH_STATE_FILE, data)
-
-def load_pending_actions() -> dict:
-    with STORE_LOCK:
-        data = load_json_file(PENDING_ACTIONS_FILE, {})
-        return data if isinstance(data, dict) else {}
-
-def save_pending_actions(data: dict) -> None:
-    with STORE_LOCK:
-        save_json_file(PENDING_ACTIONS_FILE, data)
-
 def is_admin(chat_id: str) -> bool:
     return str(chat_id) in ADMIN_CHAT_IDS
 
 def get_public_base_url() -> str:
+    # Render নিজে থেকেই লাইভ URL এই ভেরিয়েবলে সেভ করে রাখে
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if render_url:
+        return render_url.rstrip("/")
+    
+    # যদি লোকাল কম্পিউটারে রান করেন তার জন্য ফলব্যাক
     try:
+        from flask import request
         if request and request.url_root:
             return request.url_root.rstrip("/")
     except Exception:
         pass
-    return "https://cloud-nest-q8o9.onrender.com"
+        
+    return "http://localhost:8080"
 
 # --- EMAIL SENDER (FACEBOOK STYLE TEMPLATE FOR BOT REGISTRATION) ---
 def send_otp_email(to_email, otp_code):
@@ -261,36 +217,22 @@ def get_logged_in_user(chat_id: str):
     with STORE_LOCK:
         sessions = load_sessions()
         email = sessions.get(chat_id)
-        
-        users = load_users()
-        
-        # FIXED: Auto Session Recovery from chat_id to prevent logouts
-        if not email:
-            for user_email, info in list(users.items()):
-                if str(info.get("chat_id")) == chat_id:
-                    email = user_email
-                    sessions[chat_id] = email
-                    save_sessions(sessions)
-                    break
-
         if not email:
             return None, None
-            
+        
+        users = load_users()
         user_info = users.get(email)
         if not user_info:
             return None, None
             
         # Check if premium expired
         if user_info.get("premium") and user_info.get("premium_expires_at"):
-            try:
-                exp_date = datetime.fromisoformat(user_info["premium_expires_at"])
-                if datetime.now(timezone.utc) > exp_date:
-                    user_info["premium"] = False
-                    user_info["premium_expires_at"] = ""
-                    users[email] = user_info
-                    save_users(users)
-            except Exception:
-                pass
+            exp_date = datetime.fromisoformat(user_info["premium_expires_at"])
+            if datetime.now(timezone.utc) > exp_date:
+                user_info["premium"] = False
+                user_info["premium_expires_at"] = ""
+                users[email] = user_info
+                save_users(users)
                 
         return email, user_info
 
@@ -461,20 +403,15 @@ def otp_ops_keyboard(lang: str):
 
 def set_pending_action(chat_id: str, action: str):
     with STORE_LOCK:
-        actions = load_pending_actions()
-        actions[str(chat_id)] = action
-        save_pending_actions(actions)
+        PENDING_ACTIONS[str(chat_id)] = action
 
 def pop_pending_action(chat_id: str):
     with STORE_LOCK:
-        actions = load_pending_actions()
-        val = actions.pop(str(chat_id), None)
-        save_pending_actions(actions)
-        return val
+        return PENDING_ACTIONS.pop(str(chat_id), None)
 
 def get_pending_action(chat_id: str):
     with STORE_LOCK:
-        return load_pending_actions().get(str(chat_id))
+        return PENDING_ACTIONS.get(str(chat_id))
 
 def escape_text(value) -> str:
     return str(value).replace("`", "'")
@@ -1591,12 +1528,10 @@ def api_otp_send():
     otp_code = str(random.randint(100000, 999999))
     if send_user_otp_email(email, otp_code):
         key = f"{api_key}_{email}"
-        otps = load_dev_otps()
-        otps[key] = {
+        DEV_OTPS[key] = {
             "otp": otp_code,
             "expires": time.time() + 300 # 5 minutes
         }
-        save_dev_otps(otps)
         return jsonify({"status": "success", "message": "OTP sent successfully."})
     return jsonify({"status": "error", "message": "Failed to send email."}), 500
 
@@ -1616,18 +1551,15 @@ def api_otp_verify():
         return jsonify({"status": "error", "message": "Invalid API Key."}), 401
 
     key = f"{api_key}_{email}"
-    otps = load_dev_otps()
-    record = otps.get(key)
+    record = DEV_OTPS.get(key)
     
     if not record: 
         return jsonify({"status": "error", "message": "OTP not found or not sent."}), 404
     if time.time() > record["expires"]:
-        del otps[key]
-        save_dev_otps(otps)
+        del DEV_OTPS[key]
         return jsonify({"status": "error", "message": "OTP expired."}), 400
     if record["otp"] == otp:
-        del otps[key]
-        save_dev_otps(otps)
+        del DEV_OTPS[key]
         return jsonify({"status": "success", "message": "OTP verified successfully."})
     
     return jsonify({"status": "error", "message": "Invalid OTP."}), 400
@@ -1805,11 +1737,7 @@ def uploaded_file(filename):
 @bot.message_handler(commands=["start", "restart"])
 def command_start(message):
     chat_id = str(message.chat.id)
-    auth_state_db = load_temp_auth_state()
-    if chat_id in auth_state_db:
-        del auth_state_db[chat_id]
-        save_temp_auth_state(auth_state_db)
-
+    TEMP_AUTH_STATE.pop(chat_id, None) # reset any pending auth states
     email, user_info = get_logged_in_user(chat_id)
     if email:
         text = f"🎉 Welcome back to CloudNest!\n\nYour API Key:\n<code>{user_info['api_key']}</code>\n\n(Tap the key to copy it)"
@@ -1918,8 +1846,7 @@ def handle_messages(message):
         return
 
     # Check for ongoing Auth Flow
-    auth_state_db = load_temp_auth_state()
-    auth_state = auth_state_db.get(chat_id)
+    auth_state = TEMP_AUTH_STATE.get(chat_id)
     if auth_state:
         action = auth_state["action"]
         state = auth_state["state"]
@@ -1933,30 +1860,26 @@ def handle_messages(message):
                 users = load_users()
                 if text in users:
                     bot.send_message(chat_id, "❌ This email is already registered. Please login.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    del TEMP_AUTH_STATE[chat_id]
                     return
                 
                 bot.send_message(chat_id, "Sending Verification OTP to your email... Please wait.")
                 otp = str(random.randint(100000, 999999))
                 if send_otp_email(text, otp):
-                    auth_state_db[chat_id]["email"] = text
-                    auth_state_db[chat_id]["otp"] = otp
-                    auth_state_db[chat_id]["state"] = "await_otp"
-                    save_temp_auth_state(auth_state_db)
+                    TEMP_AUTH_STATE[chat_id]["email"] = text
+                    TEMP_AUTH_STATE[chat_id]["otp"] = otp
+                    TEMP_AUTH_STATE[chat_id]["state"] = "await_otp"
                     bot.send_message(chat_id, "✅ OTP Sent! Please check your email and enter the 6-digit code:")
                 else:
                     bot.send_message(chat_id, "❌ Failed to send OTP email. Please try again later.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    del TEMP_AUTH_STATE[chat_id]
                 return
 
             if state == "await_otp":
                 if text != auth_state["otp"]:
                     bot.send_message(chat_id, "❌ Incorrect OTP. Try again:")
                     return
-                auth_state_db[chat_id]["state"] = "await_pass"
-                save_temp_auth_state(auth_state_db)
+                TEMP_AUTH_STATE[chat_id]["state"] = "await_pass"
                 bot.send_message(chat_id, "✅ Email Verified!\n\nPlease set a password for your CloudNest account:")
                 return
 
@@ -1970,7 +1893,6 @@ def handle_messages(message):
                     "email": email,
                     "password": password,
                     "api_key": api_key,
-                    "chat_id": chat_id, # ADDED: For secure auto recovery against wipes
                     "premium": False,
                     "premium_expires_at": "",
                     "created_at": now_iso(),
@@ -1982,9 +1904,7 @@ def handle_messages(message):
                 sessions[chat_id] = email
                 save_sessions(sessions)
                 
-                del auth_state_db[chat_id]
-                save_temp_auth_state(auth_state_db)
-
+                del TEMP_AUTH_STATE[chat_id]
                 msg = f"🎉 Account Registered Successfully!\n\nYour API Key:\n<code>{api_key}</code>\n\n(Tap the key to copy)"
                 bot.send_message(chat_id, msg, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
                 return
@@ -1995,30 +1915,26 @@ def handle_messages(message):
                 users = load_users()
                 if text not in users:
                     bot.send_message(chat_id, "❌ Email not found. Please register first.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    del TEMP_AUTH_STATE[chat_id]
                     return
                 
                 bot.send_message(chat_id, "Sending Login OTP... Please wait.")
                 otp = str(random.randint(100000, 999999))
                 if send_otp_email(text, otp):
-                    auth_state_db[chat_id]["email"] = text
-                    auth_state_db[chat_id]["otp"] = otp
-                    auth_state_db[chat_id]["state"] = "await_otp"
-                    save_temp_auth_state(auth_state_db)
+                    TEMP_AUTH_STATE[chat_id]["email"] = text
+                    TEMP_AUTH_STATE[chat_id]["otp"] = otp
+                    TEMP_AUTH_STATE[chat_id]["state"] = "await_otp"
                     bot.send_message(chat_id, "✅ OTP Sent! Please check your email and enter the 6-digit code:")
                 else:
                     bot.send_message(chat_id, "❌ Failed to send OTP.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    del TEMP_AUTH_STATE[chat_id]
                 return
 
             if state == "await_otp":
                 if text != auth_state["otp"]:
                     bot.send_message(chat_id, "❌ Incorrect OTP. Try again:")
                     return
-                auth_state_db[chat_id]["state"] = "await_pass"
-                save_temp_auth_state(auth_state_db)
+                TEMP_AUTH_STATE[chat_id]["state"] = "await_pass"
                 bot.send_message(chat_id, "✅ OTP Verified!\n\nEnter your account password:")
                 return
 
@@ -2027,39 +1943,27 @@ def handle_messages(message):
                 users = load_users()
                 if users[email]["password"] != text:
                     bot.send_message(chat_id, "❌ Incorrect Password. Login failed.", reply_markup=auth_welcome_keyboard())
-                    del auth_state_db[chat_id]
-                    save_temp_auth_state(auth_state_db)
+                    del TEMP_AUTH_STATE[chat_id]
                     return
 
                 sessions = load_sessions()
                 sessions[chat_id] = email
                 save_sessions(sessions)
 
-                del auth_state_db[chat_id]
-                save_temp_auth_state(auth_state_db)
-
+                del TEMP_AUTH_STATE[chat_id]
                 api_key = users[email]["api_key"]
-                
-                # Make sure to link chat_id if they log in again from another device
-                users[email]["chat_id"] = chat_id
-                save_users(users)
-                
                 msg = f"✅ Logged in successfully!\n\nYour API Key:\n<code>{api_key}</code>\n\n(Tap the key to copy)"
                 bot.send_message(chat_id, msg, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
                 return
 
     # Check for Login commands triggers
     if text == "Register":
-        auth_state_db = load_temp_auth_state()
-        auth_state_db[chat_id] = {"action": "register", "state": "await_email"}
-        save_temp_auth_state(auth_state_db)
+        TEMP_AUTH_STATE[chat_id] = {"action": "register", "state": "await_email"}
         bot.send_message(chat_id, "Enter your Gmail address (@gmail.com):", reply_markup=types.ReplyKeyboardRemove())
         return
 
     if text == "Login":
-        auth_state_db = load_temp_auth_state()
-        auth_state_db[chat_id] = {"action": "login", "state": "await_email"}
-        save_temp_auth_state(auth_state_db)
+        TEMP_AUTH_STATE[chat_id] = {"action": "login", "state": "await_email"}
         bot.send_message(chat_id, "Enter your registered Gmail address:", reply_markup=types.ReplyKeyboardRemove())
         return
 
