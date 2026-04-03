@@ -1,5 +1,5 @@
-Flask==3.0.2
+pyTelegramBotAPI==4.14.0
+Flask==3.0.0
 Flask-Cors==4.0.0
-pyTelegramBotAPI==4.15.4
 Werkzeug==3.0.1
-gunicorn==21.2.0
+requests==2.31.0
