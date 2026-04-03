@@ -31,13 +31,14 @@ ADMIN_CHAT_IDS = {x.strip() for x in ADMIN_CHAT_IDS_RAW.split(",") if x.strip()}
 if not ADMIN_CHAT_IDS:
     ADMIN_CHAT_IDS = set()
 
-# SMTP CONFIG FOR OTP (Environment Variable থেকে নিবে)
-SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "cloudnestotp@gmail.com")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "smeu dhdn zdou yfwc")
+# ---- ঠিক এই জায়গাটুকু পরিবর্তন করুন ----
+# SMTP CONFIG FOR OTP
+SMTP_EMAIL = "cloudnestotp@gmail.com"
+SMTP_PASSWORD = "smeu dhdn zdou yfwc"
 
-# ADMIN API KEY (Environment Variable থেকে নিবে)
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "rf_admin_your_secure_key_here")
-
+# ADMIN API KEY
+ADMIN_API_KEY = "rf_admin250fahim771357013"
+# ----------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 UPLOAD_FOLDER = os.path.join(DATA_DIR, "uploads")
